@@ -727,9 +727,18 @@ static gboolean find_text(AppState *state) {
 
 static void find_next(GtkWidget *widget, gpointer data) { (void)widget; find_text(data); }
 
+static void update_replace_toggle(GtkWidget *button, gboolean expanded) {
+    const char *label = expanded ? "Hide replacement controls" : "Show replacement controls";
+    gtk_button_set_icon_name(GTK_BUTTON(button), expanded ? "pan-down-symbolic" : "pan-end-symbolic");
+    gtk_widget_set_tooltip_text(button, expanded ? label : "Show replacement controls (Ctrl+H)");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(button), GTK_ACCESSIBLE_PROPERTY_LABEL, label, -1);
+    gtk_accessible_update_state(GTK_ACCESSIBLE(button), GTK_ACCESSIBLE_STATE_EXPANDED, expanded, -1);
+}
+
 static void toggle_replace(GtkToggleButton *button, gpointer data) {
     AppState *state = data;
     gboolean replace = gtk_toggle_button_get_active(button);
+    update_replace_toggle(GTK_WIDGET(button), replace);
     gtk_widget_set_visible(state->replace_row, replace);
     /* Selecting an entry's text can take the primary selection from the match. */
     gtk_entry_grab_focus_without_selecting(GTK_ENTRY(replace ? state->replace_entry : state->find_entry));
@@ -1254,14 +1263,14 @@ static void build_search_bar(AppState *state) {
     state->find_bar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_add_css_class(state->find_bar, "find-bar");
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    state->replace_toggle = gtk_toggle_button_new();
+    update_replace_toggle(state->replace_toggle, FALSE);
+    gtk_box_append(GTK_BOX(row), state->replace_toggle);
     state->find_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(state->find_entry), "Find");
     gtk_widget_set_hexpand(state->find_entry, TRUE);
     gtk_box_append(GTK_BOX(row), state->find_entry);
     gtk_box_append(GTK_BOX(row), action_button("Find Next", "app.find-next"));
-    state->replace_toggle = gtk_toggle_button_new_with_label("Replace");
-    gtk_widget_set_tooltip_text(state->replace_toggle, "Show or hide replacement field (Ctrl+H)");
-    gtk_box_append(GTK_BOX(row), state->replace_toggle);
     GtkWidget *close = gtk_button_new_with_label("Close");
     gtk_box_append(GTK_BOX(row), close);
     gtk_box_append(GTK_BOX(state->find_bar), row);

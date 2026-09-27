@@ -22,7 +22,7 @@ Requires a C compiler, `pkg-config`, GTK 4.10 or newer, and the `gtksourceview-5
 | View | Status Bar, Right-to-Left Reading Order, Zoom In/Out/Reset |
 | Help | Local help (`F1`), About Quillmote |
 
-- Find supports case matching, upward/downward search, and optional wraparound. The Replace toggle in the Find bar reveals replacement controls while keeping your search and options. Ctrl+H also opens Replace. Replace supports individual matches and Replace All, including undo of the whole operation. Escape closes the search panel.
+- Find supports case matching, upward/downward search, and optional wraparound. The arrow beside the Find field expands or collapses replacement controls while keeping your search and options. Ctrl+H also opens Replace. Replace supports individual matches and Replace All, including undo of the whole operation. Escape closes the search panel.
 - Standard GTK text-editing shortcuts work, including `Ctrl+Z`, `Ctrl+Shift+Z`, `Ctrl+X/C/V`, `Ctrl+A`, and keyboard navigation. Go To uses document line numbers and remains available with word wrap enabled.
 - New, Open, Exit, and closing the window offer Save / Don't Save / Cancel when the document is modified. Cancelling Save As retains the original filename. Failed saves preserve the document and do not continue a pending close or open.
 - Drop a single file anywhere on the window to open it. Unsaved changes get the same Save / Don’t Save / Cancel choices as Open.
