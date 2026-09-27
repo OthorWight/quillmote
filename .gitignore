@@ -3,3 +3,4 @@ tests/appearance
 tests/document
 tests/features
 tests/workflows
+tests/editor

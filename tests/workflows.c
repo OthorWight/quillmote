@@ -11,11 +11,17 @@ static void spin(void) {
 }
 
 static void settle(AppState *state) {
+    AppState *window = window_state(state);
     gint64 deadline = g_get_monotonic_time() + 30 * G_TIME_SPAN_SECOND;
+    gboolean pending;
     do {
-        spin();
+        spin(); pending = FALSE;
+        for (guint i = 0; window->tabs && i < window->tabs->len; i++) {
+            AppState *tab = g_ptr_array_index(window->tabs, i);
+            if (!tab->disposed) pending |= tab->loading || tab->recovery_writing || tab->recovery_idle || tab->recovery_start_idle;
+        }
         g_assert_cmpint(g_get_monotonic_time(), <, deadline);
-    } while (state->loading || state->recovery_writing || state->recovery_idle || state->recovery_start_idle);
+    } while (pending);
 }
 
 static void assert_text(AppState *state, const char *expected) {
@@ -135,11 +141,13 @@ static gboolean heartbeat(gpointer data) {
     (*(int *)data)++; return G_SOURCE_CONTINUE;
 }
 
-static void test_loading(AppState *state, const char *directory) {
+static void test_loading(AppState *window, const char *directory) {
+    AppState *state = active_state(window);
     gchar *missing = g_build_filename(directory, "new-document.txt", NULL);
     gtk_text_buffer_set_modified(GTK_TEXT_BUFFER(state->buffer), FALSE);
     GFile *file = g_file_new_for_path(missing);
-    open_files(G_APPLICATION(state->app), &file, 1, "", state); settle(state);
+    open_files(G_APPLICATION(state->app), &file, 1, "", window); settle(window);
+    state = active_state(window);
     g_assert_cmpstr(state->filename, ==, missing); assert_text(state, "");
     g_assert_false(g_file_test(missing, G_FILE_TEST_EXISTS));
     g_action_group_activate_action(G_ACTION_GROUP(state->app), "save", NULL);
@@ -179,18 +187,15 @@ static void test_loading(AppState *state, const char *directory) {
     g_assert_true(g_action_group_get_action_enabled(G_ACTION_GROUP(state->app), "save"));
     g_print("Large-file loading yielded to %d UI timer ticks.\n", ticks);
 
-    /* A drop must take the same unsaved-change path as Open. */
+    /* Dropping an already-open file selects it without losing edits. */
     gtk_text_buffer_set_text(GTK_TEXT_BUFFER(state->buffer), "unsaved before drop", -1);
     file = g_file_new_for_path(path);
     GdkFileList *list = gdk_file_list_new_from_array(&file, 1);
     GValue value = G_VALUE_INIT;
     g_value_init(&value, GDK_TYPE_FILE_LIST); g_value_take_boxed(&value, list);
-    g_assert_true(file_dropped(NULL, &value, 0, 0, state));
-    answer(state, "Cancel"); assert_text(state, "unsaved before drop");
-    g_assert_true(file_dropped(NULL, &value, 0, 0, state));
-    answer(state, "Don't Save");
-    g_assert_cmpstr(state->filename, ==, path);
-    g_assert_cmpint(gtk_text_buffer_get_line_count(GTK_TEXT_BUFFER(state->buffer)), ==, 100001);
+    g_assert_true(file_dropped(NULL, &value, 0, 0, window)); settle(window);
+    g_assert_true(active_state(window) == state);
+    assert_text(state, "unsaved before drop");
     g_value_unset(&value); g_object_unref(file);
 
     gchar *absent = g_build_filename(directory, "does-not-exist.txt", NULL);
@@ -215,18 +220,20 @@ static void test_recovery_with_explicit_file(AppState *active, const char *direc
     settle(&other); assert_text(&other, "requested file");
     g_assert_true(gtk_widget_get_visible(other.recovery_bar));
     recover_clicked(NULL, &other); settle(&other);
-    assert_text(&other, document.text);
-    g_assert_null(other.filename); g_assert_cmpint(other.encoding, ==, ENCODING_BYTES);
-    g_assert_true(other.recovered);
-    recovery_tick(&other); settle(&other);
+    AppState *recovered = active_state(&other);
+    assert_text(&other, "requested file");
+    assert_text(recovered, document.text);
+    g_assert_null(recovered->filename); g_assert_cmpint(recovered->encoding, ==, ENCODING_BYTES);
+    g_assert_true(recovered->recovered);
+    recovery_tick(recovered); settle(recovered);
     g_assert_null(recovery_find(active->recovery_directory));
-    RecoveryDocument *snapshot = recovery_read(other.recovery->path, NULL);
+    RecoveryDocument *snapshot = recovery_read(recovered->recovery->path, NULL);
     g_assert_nonnull(snapshot); g_assert_cmpstr(snapshot->text, ==, document.text);
     g_assert_cmpint(snapshot->encoding, ==, ENCODING_BYTES); recovery_document_free(snapshot);
     /* Explicit discard removes only this window's work. */
-    other.pending = PENDING_NEW; perform_pending(&other);
-    g_assert_false(g_file_test(other.recovery->path, G_FILE_TEST_EXISTS));
-    settle(&other);
+    recovered->pending = PENDING_NEW; perform_pending(recovered);
+    g_assert_false(g_file_test(recovered->recovery->path, G_FILE_TEST_EXISTS));
+    settle(recovered);
     gtk_window_destroy(GTK_WINDOW(other.window)); shutdown_app(G_APPLICATION(app), &other);
     g_object_unref(app); g_free(path);
 }
@@ -265,6 +272,7 @@ int main(int argc, char **argv) {
     test_recovery_with_explicit_file(&state, directory);
     test_zoom_spelling(&state);
     test_loading(&state, directory);
+    select_tab(&state);
     gtk_window_set_default_size(GTK_WINDOW(state.window), 1050, 740);
     remember_window(G_OBJECT(state.window), NULL, &state);
     save_preferences(&state);

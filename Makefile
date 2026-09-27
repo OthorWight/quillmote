@@ -13,11 +13,15 @@ quillmote: main.c $(SUPPORT_SOURCES) $(HEADERS)
 run: quillmote
 	./quillmote
 
-test: tests/document tests/appearance tests/features tests/workflows
+test: tests/document tests/appearance tests/features tests/workflows tests/editor
 	./tests/document
 	./tests/appearance
 	./tests/features
 	./tests/workflows
+	./tests/editor
+
+tests/editor: tests/editor.c main.c $(SUPPORT_SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) tests/editor.c $(SUPPORT_SOURCES) -o $@ $(GTK_LIBS) -ldl
 
 tests/workflows: tests/workflows.c main.c $(SUPPORT_SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) tests/workflows.c $(SUPPORT_SOURCES) -o $@ $(GTK_LIBS) -ldl
@@ -32,6 +36,6 @@ tests/appearance: tests/appearance.c main.c $(SUPPORT_SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) tests/appearance.c $(SUPPORT_SOURCES) -o $@ $(GTK_LIBS) -ldl
 
 clean:
-	rm -f quillmote tests/appearance tests/document tests/features tests/workflows
+	rm -f quillmote tests/appearance tests/document tests/features tests/workflows tests/editor
 
 .PHONY: all run test clean

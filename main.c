@@ -9,16 +9,32 @@
 #include <glib/gstdio.h>
 #include <errno.h>
 
-typedef enum { PENDING_NONE, PENDING_NEW, PENDING_OPEN, PENDING_QUIT, PENDING_PATH, PENDING_CREATE, PENDING_RECOVER } PendingAction;
+typedef enum { PENDING_NONE, PENDING_NEW, PENDING_OPEN, PENDING_QUIT, PENDING_PATH, PENDING_CREATE, PENDING_RECOVER, PENDING_CLOSE } PendingAction;
 
 typedef struct LoadJob LoadJob;
-
 typedef struct {
+    int offset, end;
+    guint words;
+    gboolean in_word, pending;
+} CountScan;
+
+typedef struct AppState {
+    struct AppState *owner, *active;
+    GPtrArray *tabs; /* Window owns live and retired callback records until shutdown. */
+    GtkWidget *notebook, *page, *tab_label;
+    gboolean closed, disposed, closing_window;
+    PendingAction after_load;
     GtkApplication *app;
     GtkWidget *window;
     GtkSourceView *view;
     GtkSourceBuffer *buffer;
     GtkWidget *status;
+    GtkSourceSearchContext *search_context;
+    GtkWidget *search_count;
+    gboolean show_word_count, show_invisibles;
+    CountScan document_count, selection_count;
+    int selection_start, selection_end;
+    guint count_idle, search_idle;
     GtkWidget *find_bar;
     GtkWidget *find_entry;
     GtkWidget *replace_toggle, *replace_row, *replace_entry, *match_case, *search_up, *search_wrap, *search_message;
@@ -46,7 +62,6 @@ typedef struct {
     LoadJob *loading;
     GCancellable *load_cancel;
     GtkWidget *loading_bar, *loading_label, *recovery_bar;
-    gboolean quit_after_load;
     RecoverySession *recovery;
     gchar *recovery_directory;
     guint recovery_timer, recovery_idle, recovery_start_idle;
@@ -70,9 +85,24 @@ typedef struct {
     void (*broker_free_dict)(void *, void *);
 } AppState;
 
-static AppState *action_state(GSimpleAction *action) {
-    return g_object_get_data(G_OBJECT(action), "quillmote-state");
+static AppState *window_state(AppState *state) { return state->owner ? state->owner : state; }
+static AppState *active_state(AppState *state) {
+    AppState *window = window_state(state);
+    return window->active ? window->active : state;
 }
+static AppState *action_state(GSimpleAction *action) {
+    return active_state(g_object_get_data(G_OBJECT(action), "quillmote-state"));
+}
+static AppState *new_tab(AppState *state);
+static AppState *open_tab(AppState *state, const char *path, gboolean create, gboolean recover);
+static void close_tab(AppState *state);
+static void quit_window(AppState *state);
+static void sync_tab_actions(AppState *state);
+static void dispose_document(AppState *state);
+static void setup_search(AppState *state);
+static void schedule_counts(AppState *state, gboolean changed);
+static void update_search_count(AppState *state);
+static void queue_search_count(AppState *state);
 
 static void apply_editor_style(AppState *state) {
     const PangoFontDescription *font = state->font;
@@ -88,10 +118,10 @@ static void apply_editor_style(AppState *state) {
     g_ascii_dtostr(size, sizeof size, (double)pango_font_description_get_size(font) / PANGO_SCALE * (state->zoom ? state->zoom : 100) / 100.0);
     PangoStyle style = pango_font_description_get_style(font);
     char *css = g_strdup_printf(
-        ".quillmote-editor { font-family: '%s'; font-size: %s%s; font-weight: %d; font-style: %s; } "
+        "#editor-%p { font-family: '%s'; font-size: %s%s; font-weight: %d; font-style: %s; } "
         ".quillmote-status { padding: 4px 8px; background: %s; color: %s; } "
         ".find-bar { padding: 5px; background: %s; }",
-        escaped_family->str, size, pango_font_description_get_size_is_absolute(font) ? "px" : "pt",
+        (void *)state, escaped_family->str, size, pango_font_description_get_size_is_absolute(font) ? "px" : "pt",
         pango_font_description_get_weight(font),
         style == PANGO_STYLE_ITALIC ? "italic" : style == PANGO_STYLE_OBLIQUE ? "oblique" : "normal",
         state->dark_mode ? "#252525" : "#d9d9d9", state->dark_mode ? "#eeeeee" : "#222222",
@@ -108,7 +138,13 @@ static void update_title(AppState *state) {
     gboolean modified = gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer));
     gchar *name = state->filename ? g_path_get_basename(state->filename) : g_strdup("Untitled");
     gchar *title = g_strdup_printf("%s%s%s - Quillmote", modified ? "*" : "", name, state->recovered ? " (Recovered)" : "");
-    gtk_window_set_title(GTK_WINDOW(state->window), title);
+    if (state->tab_label) {
+        gchar *tab = g_strdup_printf("%s%s", modified ? "*" : "", name);
+        gtk_label_set_width_chars(GTK_LABEL(state->tab_label), CLAMP(g_utf8_strlen(tab, -1), 8, 24));
+        gtk_label_set_text(GTK_LABEL(state->tab_label), tab); g_free(tab);
+        gtk_widget_set_tooltip_text(state->tab_label, state->filename ? state->filename : "Untitled");
+    }
+    if (active_state(state) == state) gtk_window_set_title(GTK_WINDOW(state->window), title);
     g_free(name);
     g_free(title);
 }
@@ -117,14 +153,24 @@ static void update_status(AppState *state) {
     GtkTextIter iter;
     GtkTextMark *mark = gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(state->buffer));
     gtk_text_buffer_get_iter_at_mark(GTK_TEXT_BUFFER(state->buffer), &iter, mark);
-    gchar *message = g_strdup_printf("Ln %d, Col %d     %s     %s     Zoom %d%%     Spell check: %s%s",
-        gtk_text_iter_get_line(&iter) + 1, gtk_text_iter_get_line_offset(&iter) + 1,
+    GString *message = g_string_new(NULL);
+    g_string_append_printf(message, "Ln %d, Col %d", gtk_text_iter_get_line(&iter) + 1, gtk_text_iter_get_line_offset(&iter) + 1);
+    if (state->show_word_count) {
+        gboolean selected = state->selection_end > state->selection_start;
+        CountScan *count = selected ? &state->selection_count : &state->document_count;
+        int characters = selected ? state->selection_end - state->selection_start : gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer));
+        gchar *words = count->pending ? g_strdup("Counting…") : g_strdup_printf("%u word%s", count->words, count->words == 1 ? "" : "s");
+        g_string_append_printf(message, "     %s%s · %d character%s", selected ? "Selection: " : "", words, characters, characters == 1 ? "" : "s");
+        g_free(words);
+    }
+    g_string_append_printf(message, "     %s     %s     Zoom %d%%     Spell check: %s%s",
         encoding_label(state->encoding), state->encoding == ENCODING_BYTES ? "Byte-preserving view" : state->ending == ENDING_CRLF ? "Windows (CRLF)" : state->ending == ENDING_CR ? "Mac (CR)" : "Unix (LF)",
         state->zoom, state->encoding == ENCODING_BYTES ? "off for raw bytes" : !state->spell_enabled ? "off" :
         state->dictionary ? state->spell_language : "unavailable",
         state->recovery_failed ? "     Recovery unavailable" : "");
-    gtk_label_set_text(GTK_LABEL(state->status), message);
-    g_free(message);
+    gtk_label_set_text(GTK_LABEL(state->status), message->str);
+    gtk_widget_set_tooltip_text(state->status, message->str);
+    g_string_free(message, TRUE);
 }
 
 static void show_error(AppState *state, const char *title, GError *error) {
@@ -197,6 +243,8 @@ struct LoadJob {
 static void bind_buffer(AppState *state, GtkSourceBuffer *buffer) {
     if (state->spell_idle) { g_source_remove(state->spell_idle); state->spell_idle = 0; }
     if (state->buffer) g_signal_handlers_disconnect_by_data(state->buffer, state);
+    gtk_source_buffer_set_implicit_trailing_newline(buffer, FALSE);
+    g_clear_object(&state->search_context);
     g_set_object(&state->buffer, buffer);
     gtk_text_view_set_buffer(GTK_TEXT_VIEW(state->view), GTK_TEXT_BUFFER(buffer));
     GdkRGBA color; gdk_rgba_parse(&color, "#e33b3b");
@@ -206,6 +254,7 @@ static void bind_buffer(AppState *state, GtkSourceBuffer *buffer) {
     g_signal_connect(buffer, "modified-changed", G_CALLBACK(modified_changed), state);
     g_signal_connect(buffer, "mark-set", G_CALLBACK(cursor_moved), state);
     apply_editor_style(state);
+    setup_search(state); schedule_counts(state, TRUE);
 }
 
 static void loading_controls(AppState *state, gboolean loading) {
@@ -213,9 +262,11 @@ static void loading_controls(AppState *state, gboolean loading) {
     gtk_widget_set_visible(state->loading_bar, loading);
     gtk_widget_set_sensitive(GTK_WIDGET(state->view), !loading);
     gtk_widget_set_sensitive(state->find_bar, !loading);
+    if (active_state(state) != state) return;
     gchar **names = g_action_group_list_actions(G_ACTION_GROUP(state->app));
     for (int i = 0; names[i]; i++) {
-        if (g_str_equal(names[i], "quit")) continue;
+        if (g_str_equal(names[i], "quit") || g_str_equal(names[i], "new") || g_str_equal(names[i], "open") ||
+            g_str_equal(names[i], "close-tab") || g_str_has_suffix(names[i], "-tab")) continue;
         GAction *action = g_action_map_lookup_action(G_ACTION_MAP(state->app), names[i]);
         g_simple_action_set_enabled(G_SIMPLE_ACTION(action), !loading);
     }
@@ -224,8 +275,8 @@ static void loading_controls(AppState *state, gboolean loading) {
 
 static void load_finished(LoadJob *job, GError *error) {
     AppState *state = job->state;
-    gboolean quit = state->quit_after_load;
-    state->quit_after_load = FALSE;
+    PendingAction after = state->after_load;
+    state->after_load = PENDING_NONE;
     state->loading = NULL;
     g_clear_object(&state->load_cancel);
     loading_controls(state, FALSE);
@@ -235,7 +286,7 @@ static void load_finished(LoadJob *job, GError *error) {
     recovery_session_free(job->claimed);
     recovery_document_free(job->document);
     g_clear_object(&job->staging); g_free(job->path); g_free(job);
-    if (quit) request_document_change(state, PENDING_QUIT, NULL);
+    if (after != PENDING_NONE) request_document_change(state, after, NULL);
     g_application_release(G_APPLICATION(state->app));
 }
 
@@ -372,6 +423,7 @@ static void cancel_load(GtkButton *button, gpointer data) {
 }
 
 static void cancel_pending(AppState *state) {
+    window_state(state)->closing_window = FALSE;
     state->busy = FALSE; state->pending = PENDING_NONE;
     g_clear_pointer(&state->pending_path, g_free);
 }
@@ -383,7 +435,20 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
     GtkFileChooser *chooser = GTK_FILE_CHOOSER(dialog);
     gboolean save = gtk_file_chooser_get_action(chooser) == GTK_FILE_CHOOSER_ACTION_SAVE;
     gboolean success = FALSE;
-    if (response == GTK_RESPONSE_ACCEPT) {
+    if (response == GTK_RESPONSE_ACCEPT && !save) {
+        GListModel *files = gtk_file_chooser_get_files(chooser);
+        for (guint i = 0; i < g_list_model_get_n_items(files); i++) {
+            GFile *file = g_list_model_get_item(files, i);
+            gchar *path = g_file_get_path(file);
+            if (path) open_tab(state, path, FALSE, FALSE);
+            else {
+                GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
+                show_error(state, "Could not access file", error); g_error_free(error);
+            }
+            g_free(path); g_object_unref(file);
+        }
+        g_object_unref(files);
+    } else if (response == GTK_RESPONSE_ACCEPT) {
         GFile *file = gtk_file_chooser_get_file(chooser);
         gchar *path = file ? g_file_get_path(file) : NULL;
         if (path) {
@@ -393,7 +458,7 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
                 const char *line_choice = gtk_file_chooser_get_choice(chooser, "line-ending");
                 LineEnding ending = line_choice ? g_ascii_strtoll(line_choice, NULL, 10) : state->ending;
                 success = save_contents(state, path, encoding, ending);
-            } else success = load_file(state, path, -1);
+            } else { open_tab(state, path, FALSE, FALSE); success = TRUE; }
         } else {
             GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
             show_error(state, "Could not access file", error); g_error_free(error);
@@ -402,7 +467,7 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
     }
     state->file_dialog = NULL;
     gtk_native_dialog_destroy(dialog); g_object_unref(dialog);
-    if (!save && success) return;
+    if (!save) { state->pending = PENDING_NONE; state->busy = state->loading != NULL; return; }
     state->busy = FALSE;
     if (save && success) perform_pending(state);
     else cancel_pending(state);
@@ -414,6 +479,7 @@ static void choose_file(AppState *state, gboolean save) {
         save ? GTK_FILE_CHOOSER_ACTION_SAVE : GTK_FILE_CHOOSER_ACTION_OPEN, save ? "Save" : "Open", "Cancel");
     state->file_dialog = GTK_NATIVE_DIALOG(dialog);
     GtkFileChooser *chooser = GTK_FILE_CHOOSER(dialog);
+    gtk_file_chooser_set_select_multiple(chooser, !save);
     GtkFileFilter *text = g_object_ref_sink(gtk_file_filter_new()); gtk_file_filter_set_name(text, "Text documents (*.txt)");
     gtk_file_filter_add_pattern(text, "*.txt"); gtk_file_chooser_add_filter(chooser, text); g_object_unref(text);
     GtkFileFilter *all = g_object_ref_sink(gtk_file_filter_new()); gtk_file_filter_set_name(all, "All files");
@@ -467,9 +533,8 @@ static void perform_pending(AppState *state) {
     else if (pending == PENDING_PATH || pending == PENDING_CREATE || pending == PENDING_RECOVER) {
         load_file_full(state, state->pending_path, -1, pending == PENDING_CREATE, pending == PENDING_RECOVER);
         g_clear_pointer(&state->pending_path, g_free);
-    } else if (pending == PENDING_QUIT) {
-        recovery_clear(state); save_preferences(state);
-        gtk_window_destroy(GTK_WINDOW(state->window));
+    } else if (pending == PENDING_CLOSE || pending == PENDING_QUIT) {
+        close_tab(state);
     }
 }
 
@@ -484,8 +549,8 @@ static void unsaved_answer(GObject *source, GAsyncResult *result, gpointer data)
 }
 
 static void request_document_change(AppState *state, PendingAction pending, const char *path) {
-    if (state->loading && pending == PENDING_QUIT) {
-        state->quit_after_load = TRUE; g_cancellable_cancel(state->load_cancel); return;
+    if (state->loading && (pending == PENDING_QUIT || pending == PENDING_CLOSE)) {
+        state->after_load = pending; g_cancellable_cancel(state->load_cancel); return;
     }
     if (state->busy) return;
     state->pending = pending;
@@ -504,14 +569,14 @@ static void request_document_change(AppState *state, PendingAction pending, cons
 }
 
 static gboolean close_requested(GtkWindow *window, gpointer data) {
-    (void)window; request_document_change(data, PENDING_QUIT, NULL); return TRUE;
+    (void)window; quit_window(data); return TRUE;
 }
 
-static void action_new(GSimpleAction *action, GVariant *parameter) { (void)parameter; request_document_change(action_state(action), PENDING_NEW, NULL); }
-static void action_open(GSimpleAction *action, GVariant *parameter) { (void)parameter; request_document_change(action_state(action), PENDING_OPEN, NULL); }
+static void action_new(GSimpleAction *action, GVariant *parameter) { (void)parameter; new_tab(action_state(action)); }
+static void action_open(GSimpleAction *action, GVariant *parameter) { (void)parameter; AppState *state = action_state(action); if (!state->busy) choose_file(state, FALSE); }
 static void action_save(GSimpleAction *action, GVariant *parameter) { (void)parameter; AppState *state = action_state(action); if (!state->busy) save_file(state); }
 static void action_save_as(GSimpleAction *action, GVariant *parameter) { (void)parameter; AppState *state = action_state(action); if (!state->busy) choose_file(state, TRUE); }
-static void action_quit(GSimpleAction *action, GVariant *parameter) { (void)parameter; request_document_change(action_state(action), PENDING_QUIT, NULL); }
+static void action_quit(GSimpleAction *action, GVariant *parameter) { (void)parameter; quit_window(action_state(action)); }
 static void action_cut(GSimpleAction *action, GVariant *parameter) { (void)parameter; gtk_text_buffer_cut_clipboard(GTK_TEXT_BUFFER(action_state(action)->buffer), gtk_widget_get_clipboard(GTK_WIDGET(action_state(action)->view)), TRUE); }
 static void action_copy(GSimpleAction *action, GVariant *parameter) { (void)parameter; gtk_text_buffer_copy_clipboard(GTK_TEXT_BUFFER(action_state(action)->buffer), gtk_widget_get_clipboard(GTK_WIDGET(action_state(action)->view))); }
 static void action_paste(GSimpleAction *action, GVariant *parameter) { (void)parameter; gtk_text_buffer_paste_clipboard(GTK_TEXT_BUFFER(action_state(action)->buffer), gtk_widget_get_clipboard(GTK_WIDGET(action_state(action)->view)), NULL, TRUE); }
@@ -565,7 +630,7 @@ static gboolean dismiss_editor_menus(AppState *state) {
 static gboolean menu_escape(GtkEventControllerKey *controller, guint keyval, guint keycode,
                             GdkModifierType modifiers, gpointer data) {
     (void)controller; (void)keycode; (void)modifiers;
-    AppState *state = data;
+    AppState *state = active_state(data);
     if (keyval != GDK_KEY_Escape) return FALSE;
     GtkWidget *focus = gtk_root_get_focus(GTK_ROOT(state->window));
     gboolean menu_focus = focus && (gtk_widget_get_ancestor(focus, GTK_TYPE_POPOVER_MENU) ||
@@ -576,6 +641,7 @@ static gboolean menu_escape(GtkEventControllerKey *controller, guint keyval, gui
 }
 
 static void spelling_actions_enabled(AppState *state, gboolean enabled) {
+    if (active_state(state) != state) return;
     const char *names[] = {"replace-spelling", "spelling-add", "spelling-ignore"};
     for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
         GAction *action = g_action_map_lookup_action(G_ACTION_MAP(state->app), names[i]);
@@ -820,22 +886,140 @@ static gboolean search_key(GtkEventControllerKey *controller, guint keyval, guin
     close_find(NULL, data); return TRUE;
 }
 
-static void set_wrap_state(GSimpleAction *action, GVariant *value, gpointer data) {
+/* Count Unicode letter/number runs; combining marks and internal apostrophes
+ * stay in the same word. Work is bounded so large documents remain responsive. */
+static gboolean count_chunk(AppState *state, CountScan *scan) {
+    GtkTextIter iter;
+    gtk_text_buffer_get_iter_at_offset(GTK_TEXT_BUFFER(state->buffer), &iter, scan->offset);
+    gint64 deadline = g_get_monotonic_time() + 2000;
+    while (scan->offset < scan->end) {
+        gunichar c = gtk_text_iter_get_char(&iter);
+        gboolean word = g_unichar_isalnum(c) || (scan->in_word && g_unichar_ismark(c));
+        if (scan->in_word && (c == '\'' || c == 0x2019)) {
+            GtkTextIter next = iter;
+            word = gtk_text_iter_forward_char(&next) && g_unichar_isalnum(gtk_text_iter_get_char(&next));
+        }
+        if (word && !scan->in_word) scan->words++;
+        scan->in_word = word;
+        gtk_text_iter_forward_char(&iter); scan->offset++;
+        if (g_get_monotonic_time() >= deadline) return FALSE;
+    }
+    scan->pending = FALSE; return TRUE;
+}
+
+static gboolean count_idle(gpointer data) {
     AppState *state = data;
+    if (state->document_count.pending) count_chunk(state, &state->document_count);
+    if (state->selection_count.pending) count_chunk(state, &state->selection_count);
+    update_status(state);
+    if (state->document_count.pending || state->selection_count.pending) return G_SOURCE_CONTINUE;
+    state->count_idle = 0; return G_SOURCE_REMOVE;
+}
+
+static void schedule_counts(AppState *state, gboolean changed) {
+    if (!state->show_word_count) return;
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
+    if (changed) state->document_count = (CountScan){.end = gtk_text_buffer_get_char_count(buffer), .pending = TRUE};
+    GtkTextIter start, end;
+    gboolean selected = gtk_text_buffer_get_selection_bounds(buffer, &start, &end);
+    int first = selected ? gtk_text_iter_get_offset(&start) : 0;
+    int last = selected ? gtk_text_iter_get_offset(&end) : 0;
+    if (changed || first != state->selection_start || last != state->selection_end) {
+        state->selection_start = first; state->selection_end = last;
+        state->selection_count = (CountScan){.offset = first, .end = last, .pending = selected};
+    }
+    if (!state->count_idle && (state->document_count.pending || state->selection_count.pending))
+        state->count_idle = g_idle_add(count_idle, state);
+}
+
+static gboolean refresh_search_count(gpointer data) {
+    AppState *state = data;
+    state->search_idle = 0; update_search_count(state);
+    return G_SOURCE_REMOVE;
+}
+
+static void queue_search_count(AppState *state) {
+    if (state->search_context && gtk_widget_get_visible(state->find_bar) && !state->search_idle)
+        state->search_idle = g_timeout_add(40, refresh_search_count, state);
+}
+
+static void update_search_count(AppState *state) {
+    if (!state->search_context || !state->search_count) return;
+    const char *query = gtk_editable_get_text(GTK_EDITABLE(state->find_entry));
+    if (!*query || !gtk_widget_get_visible(state->find_bar)) {
+        gtk_label_set_text(GTK_LABEL(state->search_count), ""); return;
+    }
+    int count = gtk_source_search_context_get_occurrences_count(state->search_context);
+    /* A scan can notify while its final region is still being retired. Refresh
+     * once that work has yielded, and only while the count remains pending. */
+    if (count < 0 && !state->search_idle) state->search_idle = g_timeout_add(40, refresh_search_count, state);
+    GtkTextIter start, end;
+    int position = 0;
+    if (count > 0 && gtk_text_buffer_get_selection_bounds(GTK_TEXT_BUFFER(state->buffer), &start, &end))
+        position = gtk_source_search_context_get_occurrence_position(state->search_context, &start, &end);
+    gchar *label = count < 0 ? g_strdup("Searching…") : count == 0 ? g_strdup("No matches") :
+        position > 0 ? g_strdup_printf("%d of %d", position, count) : g_strdup_printf("%d match%s", count, count == 1 ? "" : "es");
+    gtk_label_set_text(GTK_LABEL(state->search_count), label); g_free(label);
+}
+
+static void search_count_changed(GObject *object, GParamSpec *spec, gpointer data) {
+    (void)object; (void)spec; update_search_count(data); queue_search_count(data);
+}
+
+static void search_options_changed(GtkWidget *widget, gpointer data) {
+    (void)widget; AppState *state = data;
+    if (!state->search_context) return;
+    gboolean visible = gtk_widget_get_visible(state->find_bar);
+    GtkSourceSearchSettings *settings = gtk_source_search_context_get_settings(state->search_context);
+    gtk_source_search_settings_set_case_sensitive(settings, gtk_check_button_get_active(GTK_CHECK_BUTTON(state->match_case)));
+    gtk_source_search_settings_set_search_text(settings, visible ? gtk_editable_get_text(GTK_EDITABLE(state->find_entry)) : NULL);
+    gtk_source_search_context_set_highlight(state->search_context, visible);
+    gtk_label_set_text(GTK_LABEL(state->search_message), "");
+    update_search_count(state); queue_search_count(state);
+}
+
+static void search_visibility_changed(GObject *object, GParamSpec *spec, gpointer data) {
+    (void)object; (void)spec; search_options_changed(NULL, data);
+}
+
+static void setup_search(AppState *state) {
+    g_clear_object(&state->search_context);
+    state->search_context = gtk_source_search_context_new(state->buffer, NULL);
+    g_signal_connect(state->search_context, "notify::occurrences-count", G_CALLBACK(search_count_changed), state);
+    search_options_changed(NULL, state);
+}
+
+static void set_invisibles_state(GSimpleAction *action, GVariant *value, gpointer data) {
+    AppState *state = active_state(data);
+    state->show_invisibles = g_variant_get_boolean(value);
+    gtk_source_space_drawer_set_enable_matrix(gtk_source_view_get_space_drawer(state->view), state->show_invisibles);
+    g_simple_action_set_state(action, value);
+}
+
+static void set_word_count_state(GSimpleAction *action, GVariant *value, gpointer data) {
+    AppState *state = active_state(data);
+    state->show_word_count = g_variant_get_boolean(value);
+    if (!state->show_word_count && state->count_idle) { g_source_remove(state->count_idle); state->count_idle = 0; }
+    schedule_counts(state, TRUE); update_status(state);
+    g_simple_action_set_state(action, value);
+}
+
+static void set_wrap_state(GSimpleAction *action, GVariant *value, gpointer data) {
+    AppState *state = active_state(data);
     state->word_wrap = g_variant_get_boolean(value);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(state->view), state->word_wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     g_simple_action_set_state(action, value);
 }
 
 static void set_status_state(GSimpleAction *action, GVariant *value, gpointer data) {
-    AppState *state = data;
+    AppState *state = active_state(data);
     state->show_status = g_variant_get_boolean(value);
     gtk_widget_set_visible(state->status, state->show_status);
     g_simple_action_set_state(action, value);
 }
 
 static void set_rtl_state(GSimpleAction *action, GVariant *value, gpointer data) {
-    AppState *state = data;
+    AppState *state = active_state(data);
     gboolean rtl = g_variant_get_boolean(value);
     gtk_widget_set_direction(GTK_WIDGET(state->view), rtl ? GTK_TEXT_DIR_RTL : GTK_TEXT_DIR_LTR);
     gtk_text_view_set_justification(GTK_TEXT_VIEW(state->view), rtl ? GTK_JUSTIFY_RIGHT : GTK_JUSTIFY_LEFT);
@@ -883,6 +1067,7 @@ static void go_to_accept(GtkWidget *widget, gpointer data) {
     (void)widget;
     GtkWidget *window = data;
     AppState *state = g_object_get_data(G_OBJECT(window), "state");
+    if (state->closed) { gtk_window_destroy(GTK_WINDOW(window)); return; }
     GtkSpinButton *spin = g_object_get_data(G_OBJECT(window), "line");
     gtk_spin_button_update(spin);
     if (go_to_line(state, gtk_spin_button_get_value_as_int(spin))) gtk_window_destroy(GTK_WINDOW(window));
@@ -939,11 +1124,12 @@ static void action_help(GSimpleAction *action, GVariant *parameter) {
     (void)parameter; AppState *state = action_state(action);
     GtkAlertDialog *dialog = gtk_alert_dialog_new("Quillmote Help");
     gtk_alert_dialog_set_detail(dialog,
-        "File: Ctrl+N New, Ctrl+O Open, Ctrl+S Save, Ctrl+Shift+S Save As, Ctrl+P Print.\n"
+        "File: Ctrl+N or Ctrl+T New Tab, Ctrl+O Open, Ctrl+S Save, Ctrl+Shift+S Save As, Ctrl+P Print.\n"
+        "Tabs: Ctrl+W Close Tab, Ctrl+Tab Next, Ctrl+Shift+Tab Previous. Drag tabs to reorder.\n"
         "Edit: Ctrl+Z Undo, Ctrl+Shift+Z Redo, Ctrl+X/C/V Cut/Copy/Paste, Ctrl+A Select All.\n"
         "Search: Ctrl+F Find, F3 Find Next, Ctrl+H Replace, Ctrl+G Go To Line. Escape closes Find/Replace.\n"
         "F5 inserts the current time and date. A file starting with .LOG on its own line gets a timestamp when opened.\n\n"
-        "Format chooses font, word wrap, and spelling language/on-off. View controls the status bar, reading order, and zoom. Appearance follows the system.\n"
+        "Format chooses font, word wrap, and spelling language/on-off. View controls word counts, invisible characters, the status bar, reading order, and zoom. Appearance follows the system.\n"
         "Zoom: Ctrl++ (or Ctrl+=), Ctrl+-, Ctrl+0 to reset. Zoom does not change the selected font or printing size.\n"
         "Right-click an underlined word for suggestions, Add to Dictionary, or Ignore Word; Shift+F10 opens the same menu.\n\n"
         "Drop a file onto the window to open it. Loading can be cancelled without losing the previous document.\n"
@@ -989,6 +1175,7 @@ static void font_dialog_done(GObject *source, GAsyncResult *result, gpointer dat
     AppState *state = data;
     GError *error = NULL;
     PangoFontDescription *font = gtk_font_dialog_choose_font_finish(GTK_FONT_DIALOG(source), result, &error);
+    if (state->closed) { if (font) pango_font_description_free(font); g_clear_error(&error); return; }
     if (font) {
         g_clear_pointer(&state->font, pango_font_description_free);
         state->font = font;
@@ -1024,8 +1211,12 @@ static gint compare_languages(gconstpointer a, gconstpointer b) {
 }
 
 static gboolean enchant_setup(AppState *state) {
+    /* Enchant registers process-wide GTypes. Keep its code loaded when the
+     * last tab closes so a new tab can safely create another broker. */
+    static void *library;
     state->spell_languages = g_ptr_array_new_with_free_func(g_free);
-    state->enchant_library = dlopen("libenchant-2.so.2", RTLD_LAZY);
+    if (!library) library = dlopen("libenchant-2.so.2", RTLD_LAZY);
+    state->enchant_library = library;
     if (!state->enchant_library) return FALSE;
     state->broker_init = dlsym(state->enchant_library, "enchant_broker_init");
     state->broker_request_dict = dlsym(state->enchant_library, "enchant_broker_request_dict");
@@ -1113,11 +1304,12 @@ static void schedule_spell_scan(GtkTextBuffer *buffer, gpointer data) {
      * a snapshot until the next opening; revision guards reject old targets. */
     spelling_actions_enabled(state, FALSE);
     if (!state->spell_idle) state->spell_idle = g_idle_add(spell_scan_idle, state);
+    schedule_counts(state, TRUE); queue_search_count(state);
     update_title(state); update_status(state);
 }
 
 static void set_spelling_state(GSimpleAction *action, GVariant *value, gpointer data) {
-    AppState *state = data;
+    AppState *state = active_state(data);
     dismiss_editor_menus(state); gtk_widget_grab_focus(GTK_WIDGET(state->view));
     state->spell_enabled = g_variant_get_boolean(value);
     g_simple_action_set_state(action, value);
@@ -1125,7 +1317,7 @@ static void set_spelling_state(GSimpleAction *action, GVariant *value, gpointer 
 }
 
 static void set_language_state(GSimpleAction *action, GVariant *value, gpointer data) {
-    AppState *state = data;
+    AppState *state = active_state(data);
     const char *language = g_variant_get_string(value, NULL);
     if (!state->broker) return;
     dismiss_editor_menus(state); gtk_widget_grab_focus(GTK_WIDGET(state->view));
@@ -1160,8 +1352,9 @@ static void action_zoom(GSimpleAction *action, GVariant *parameter) {
 }
 
 static void cursor_moved(GtkTextBuffer *buffer, GtkTextIter *location, GtkTextMark *mark, gpointer data) {
-    (void)buffer; (void)location; (void)mark;
-    update_status(data);
+    (void)location;
+    if (mark != gtk_text_buffer_get_insert(buffer) && mark != gtk_text_buffer_get_selection_bound(buffer)) return;
+    schedule_counts(data, FALSE); update_status(data); update_search_count(data);
 }
 
 static void add_action(AppState *state, const char *name, GCallback callback) {
@@ -1178,7 +1371,7 @@ static gchar *preferences_path(void) {
 
 static void load_preferences(AppState *state) {
     state->font = pango_font_description_from_string("Monospace 12");
-    state->word_wrap = TRUE; state->show_status = TRUE; state->spell_enabled = TRUE;
+    state->word_wrap = TRUE; state->show_status = TRUE; state->spell_enabled = TRUE; state->show_word_count = TRUE;
     state->window_width = 920; state->window_height = 620; state->zoom = 100;
     print_options_init(&state->printing);
     GKeyFile *settings = g_key_file_new();
@@ -1200,6 +1393,8 @@ static void load_preferences(AppState *state) {
         if (g_key_file_has_key(settings, "Editor", "word-wrap", NULL)) state->word_wrap = g_key_file_get_boolean(settings, "Editor", "word-wrap", NULL);
         if (g_key_file_has_key(settings, "Editor", "status-bar", NULL)) state->show_status = g_key_file_get_boolean(settings, "Editor", "status-bar", NULL);
         if (g_key_file_has_key(settings, "Editor", "spell-enabled", NULL)) state->spell_enabled = g_key_file_get_boolean(settings, "Editor", "spell-enabled", NULL);
+        if (g_key_file_has_key(settings, "Editor", "word-count", NULL)) state->show_word_count = g_key_file_get_boolean(settings, "Editor", "word-count", NULL);
+        state->show_invisibles = g_key_file_get_boolean(settings, "Editor", "invisible-characters", NULL);
         state->spell_language = g_key_file_get_string(settings, "Editor", "spell-language", NULL);
         int width = g_key_file_get_integer(settings, "Window", "width", NULL);
         int height = g_key_file_get_integer(settings, "Window", "height", NULL);
@@ -1226,10 +1421,12 @@ static void save_preferences(AppState *state) {
     g_key_file_set_boolean(settings, "Editor", "word-wrap", state->word_wrap);
     g_key_file_set_boolean(settings, "Editor", "status-bar", state->show_status);
     g_key_file_set_boolean(settings, "Editor", "spell-enabled", state->spell_enabled);
+    g_key_file_set_boolean(settings, "Editor", "word-count", state->show_word_count);
+    g_key_file_set_boolean(settings, "Editor", "invisible-characters", state->show_invisibles);
     if (state->spell_language) g_key_file_set_string(settings, "Editor", "spell-language", state->spell_language);
-    g_key_file_set_integer(settings, "Window", "width", state->window_width);
-    g_key_file_set_integer(settings, "Window", "height", state->window_height);
-    g_key_file_set_boolean(settings, "Window", "maximized", state->maximized);
+    g_key_file_set_integer(settings, "Window", "width", window_state(state)->window_width);
+    g_key_file_set_integer(settings, "Window", "height", window_state(state)->window_height);
+    g_key_file_set_boolean(settings, "Window", "maximized", window_state(state)->maximized);
     gtk_page_setup_to_key_file(state->printing.page_setup, settings, "Page Setup");
     g_key_file_set_string(settings, "Print", "header", state->printing.header);
     g_key_file_set_string(settings, "Print", "footer", state->printing.footer);
@@ -1270,6 +1467,8 @@ static void build_search_bar(AppState *state) {
     gtk_entry_set_placeholder_text(GTK_ENTRY(state->find_entry), "Find");
     gtk_widget_set_hexpand(state->find_entry, TRUE);
     gtk_box_append(GTK_BOX(row), state->find_entry);
+    state->search_count = gtk_label_new(NULL);
+    gtk_box_append(GTK_BOX(row), state->search_count);
     gtk_box_append(GTK_BOX(row), action_button("Find Next", "app.find-next"));
     GtkWidget *close = gtk_button_new_with_label("Close");
     gtk_box_append(GTK_BOX(row), close);
@@ -1294,6 +1493,9 @@ static void build_search_bar(AppState *state) {
     gtk_box_append(GTK_BOX(state->find_bar), state->search_message);
     gtk_widget_set_visible(state->find_bar, FALSE);
     gtk_widget_set_visible(state->replace_row, FALSE);
+    g_signal_connect(state->find_entry, "changed", G_CALLBACK(search_options_changed), state);
+    g_signal_connect(state->match_case, "toggled", G_CALLBACK(search_options_changed), state);
+    g_signal_connect(state->find_bar, "notify::visible", G_CALLBACK(search_visibility_changed), state);
     g_signal_connect(close, "clicked", G_CALLBACK(close_find), state);
     g_signal_connect(state->replace_toggle, "toggled", G_CALLBACK(toggle_replace), state);
     g_signal_connect(state->find_entry, "activate", G_CALLBACK(find_next), state);
@@ -1312,18 +1514,18 @@ static void remember_window(GObject *window, GParamSpec *spec, gpointer data) {
 
 static gboolean file_dropped(GtkDropTarget *target, const GValue *value, double x, double y, gpointer data) {
     (void)target; (void)x; (void)y;
-    AppState *state = data;
+    AppState *state = active_state(data);
     if (state->busy || !G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST)) return FALSE;
     GSList *files = gdk_file_list_get_files(g_value_get_boxed(value));
     if (!files) return FALSE;
-    if (files->next) {
-        GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                                           "Drop one file per Quillmote window.");
-        show_error(state, "Could not open files", error); g_error_free(error); return TRUE;
+    for (GSList *item = files; item; item = item->next) {
+        gchar *path = g_file_get_path(item->data);
+        if (path) { open_tab(state, path, FALSE, FALSE); g_free(path); }
+        else {
+            GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
+            show_error(state, "Could not open file", error); g_error_free(error);
+        }
     }
-    gchar *path = g_file_get_path(files->data);
-    if (!path) return FALSE;
-    request_document_change(state, PENDING_PATH, path); g_free(path);
     return TRUE;
 }
 
@@ -1347,7 +1549,7 @@ static void recover_clicked(GtkButton *button, gpointer data) {
     (void)button; AppState *state = data;
     if (state->busy) return;
     gchar *path = recovery_find(state->recovery_directory);
-    if (path) request_document_change(state, PENDING_RECOVER, path);
+    if (path) open_tab(state, path, FALSE, TRUE);
     else recovery_refresh(state);
     g_free(path);
 }
@@ -1357,7 +1559,13 @@ static gboolean startup_recovery(gpointer data) {
     state->recovery_start_idle = 0;
     recovery_refresh(state);
     if (!state->busy && !state->filename && !gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer)) &&
-        gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer)) == 0) recover_clicked(NULL, state);
+        gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer)) == 0) {
+        gchar *path;
+        while ((path = recovery_find(state->recovery_directory))) {
+            AppState *tab = open_tab(state, path, FALSE, TRUE); g_free(path);
+            if (!tab || !tab->loading) break;
+        }
+    }
     return G_SOURCE_REMOVE;
 }
 
@@ -1439,65 +1647,108 @@ static gboolean recovery_tick(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
-static void activate(GtkApplication *app, gpointer data) {
-    AppState *state = data;
-    if (state->window) { gtk_window_present(GTK_WINDOW(state->window)); return; }
-    state->app = app;
-    load_preferences(state);
-    enchant_setup(state);
-    state->window = gtk_application_window_new(app);
-    g_signal_connect(state->window, "close-request", G_CALLBACK(close_requested), state);
-    gtk_window_set_default_size(GTK_WINDOW(state->window), state->window_width, state->window_height);
-    if (state->maximized) gtk_window_maximize(GTK_WINDOW(state->window));
-    g_signal_connect(state->window, "notify::default-width", G_CALLBACK(remember_window), state);
-    g_signal_connect(state->window, "notify::default-height", G_CALLBACK(remember_window), state);
-    g_signal_connect(state->window, "notify::maximized", G_CALLBACK(remember_window), state);
-    gtk_window_set_titlebar(GTK_WINDOW(state->window), gtk_header_bar_new());
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_window_set_child(GTK_WINDOW(state->window), root);
+static void select_tab(AppState *state) {
+    AppState *window = window_state(state);
+    int page = gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), state->page);
+    if (page >= 0) gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook), page);
+}
 
-    GMenu *file = g_menu_new();
-    g_menu_append(file, "_New", "app.new"); g_menu_append(file, "_Open...", "app.open");
-    g_menu_append(file, "_Save", "app.save"); g_menu_append(file, "Save _As...", "app.save-as");
-    g_menu_append(file, "Page Set_up...", "app.page-setup"); g_menu_append(file, "_Print...", "app.print"); g_menu_append(file, "E_xit", "app.quit");
-    GMenu *edit = g_menu_new();
-    g_menu_append(edit, "_Undo", "app.undo"); g_menu_append(edit, "_Redo", "app.redo");
-    g_menu_append(edit, "Cu_t", "app.cut"); g_menu_append(edit, "_Copy", "app.copy"); g_menu_append(edit, "_Paste", "app.paste");
-    g_menu_append(edit, "De_lete", "app.delete"); g_menu_append(edit, "_Find...", "app.find");
-    g_menu_append(edit, "Find _Next", "app.find-next"); g_menu_append(edit, "R_eplace...", "app.replace");
-    g_menu_append(edit, "_Go To...", "app.go-to"); g_menu_append(edit, "Select _All", "app.select-all"); g_menu_append(edit, "Time/_Date", "app.time-date");
-    GMenu *format = g_menu_new(); g_menu_append(format, "_Word Wrap", "app.wrap"); g_menu_append(format, "_Font...", "app.font");
-    GMenu *spelling = g_menu_new(), *languages = g_menu_new();
-    g_menu_append(spelling, "Check Spelling", "app.spell-enabled");
-    for (guint i = 0; i < state->spell_languages->len; i++) {
-        const char *tag = g_ptr_array_index(state->spell_languages, i);
-        gchar *label = g_strdup(tag); g_strdelimit(label, "_", '-');
-        GMenuItem *item = g_menu_item_new(label, NULL); g_free(label);
-        g_menu_item_set_action_and_target(item, "app.spell-language", "s", tag);
-        g_menu_append_item(languages, item); g_object_unref(item);
+static void sync_tab_actions(AppState *state) {
+    const struct { const char *name; gboolean value; } toggles[] = {
+        {"wrap", state->word_wrap}, {"status-bar", state->show_status},
+        {"spell-enabled", state->spell_enabled}, {"word-count", state->show_word_count}, {"invisible-characters", state->show_invisibles},
+        {"rtl", gtk_widget_get_direction(GTK_WIDGET(state->view)) == GTK_TEXT_DIR_RTL}
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(toggles); i++) {
+        GAction *action = g_action_map_lookup_action(G_ACTION_MAP(state->app), toggles[i].name);
+        if (action) g_simple_action_set_state(G_SIMPLE_ACTION(action), g_variant_new_boolean(toggles[i].value));
     }
-    if (!state->spell_languages->len) g_menu_append(languages, "No dictionaries installed", NULL);
-    g_menu_append_submenu(spelling, "Language", G_MENU_MODEL(languages));
-    g_menu_append_submenu(format, "Spelling", G_MENU_MODEL(spelling));
-    g_object_unref(spelling); g_object_unref(languages);
-    GMenu *view = g_menu_new(); g_menu_append(view, "_Status Bar", "app.status-bar"); g_menu_append(view, "_Right-to-Left Reading Order", "app.rtl");
-    GMenu *zoom = g_menu_new();
-    g_menu_append(zoom, "Zoom In", "app.zoom-in"); g_menu_append(zoom, "Zoom Out", "app.zoom-out");
-    g_menu_append(zoom, "Reset Zoom", "app.zoom-reset");
-    g_menu_append_submenu(view, "Zoom", G_MENU_MODEL(zoom)); g_object_unref(zoom);
-    GMenu *help = g_menu_new(); g_menu_append(help, "View _Help", "app.help"); g_menu_append(help, "_About Quillmote", "app.about");
-    GMenu *menubar = g_menu_new();
-    g_menu_append_submenu(menubar, "_File", G_MENU_MODEL(file)); g_menu_append_submenu(menubar, "_Edit", G_MENU_MODEL(edit));
-    g_menu_append_submenu(menubar, "F_ormat", G_MENU_MODEL(format)); g_menu_append_submenu(menubar, "_View", G_MENU_MODEL(view)); g_menu_append_submenu(menubar, "_Help", G_MENU_MODEL(help));
-    GtkWidget *menu_bar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(menubar));
-    configure_menu_popovers(menu_bar);
-    gtk_box_append(GTK_BOX(root), menu_bar);
-    GtkEventController *escape = gtk_event_controller_key_new();
-    gtk_event_controller_set_propagation_phase(escape, GTK_PHASE_CAPTURE);
-    g_signal_connect(escape, "key-pressed", G_CALLBACK(menu_escape), state);
-    gtk_widget_add_controller(state->window, escape);
-    g_object_unref(file); g_object_unref(edit); g_object_unref(format); g_object_unref(view); g_object_unref(help); g_object_unref(menubar);
+    GAction *language = g_action_map_lookup_action(G_ACTION_MAP(state->app), "spell-language");
+    if (language) g_simple_action_set_state(G_SIMPLE_ACTION(language), g_variant_new_string(state->spell_language ? state->spell_language : ""));
+    gboolean busy = state->busy;
+    loading_controls(state, state->loading != NULL); state->busy = busy;
+    spelling_actions_enabled(state, FALSE);
+}
 
+static void tab_switched(GtkNotebook *notebook, GtkWidget *page, guint index, gpointer data) {
+    (void)notebook; (void)index;
+    AppState *window = data, *state = g_object_get_data(G_OBJECT(page), "document");
+    if (!state || state->closed) return;
+    window->active = state;
+    sync_tab_actions(state); update_title(state); update_status(state);
+    gtk_widget_grab_focus(GTK_WIDGET(state->view));
+}
+
+static void tab_close_clicked(GtkButton *button, gpointer data) {
+    (void)button; AppState *state = data;
+    if (state->closed || window_state(state)->closing_window) return;
+    select_tab(state);
+    request_document_change(state, PENDING_CLOSE, NULL);
+}
+
+static void attach_tab(AppState *state) {
+    AppState *window = window_state(state);
+    GtkWidget *label = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    state->tab_label = gtk_label_new("Untitled");
+    gtk_label_set_ellipsize(GTK_LABEL(state->tab_label), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars(GTK_LABEL(state->tab_label), 24);
+    gtk_box_append(GTK_BOX(label), state->tab_label);
+    GtkWidget *close = gtk_button_new_from_icon_name("window-close-symbolic");
+    gtk_widget_add_css_class(close, "flat");
+    gtk_widget_set_tooltip_text(close, "Close tab (Ctrl+W)");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(close), GTK_ACCESSIBLE_PROPERTY_LABEL, "Close tab", -1);
+    g_signal_connect(close, "clicked", G_CALLBACK(tab_close_clicked), state);
+    gtk_box_append(GTK_BOX(label), close);
+    g_ptr_array_add(window->tabs, state);
+    gtk_notebook_append_page(GTK_NOTEBOOK(window->notebook), state->page, label);
+    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(window->notebook), state->page, TRUE);
+    select_tab(state); update_title(state);
+}
+
+static void quit_window(AppState *state) {
+    AppState *window = window_state(state);
+    for (guint i = 0; i < window->tabs->len; i++) {
+        AppState *tab = g_ptr_array_index(window->tabs, i);
+        if (!tab->closed && tab->busy && !tab->loading) return;
+    }
+    window->closing_window = TRUE;
+    if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)) == 0) {
+        window->active = NULL;
+        gtk_window_destroy(GTK_WINDOW(window->window)); return;
+    }
+    AppState *tab = window->active;
+    request_document_change(tab, PENDING_QUIT, NULL);
+}
+
+static void close_tab(AppState *state) {
+    AppState *window = window_state(state);
+    save_preferences(state); recovery_clear(state);
+    state->closed = TRUE;
+    int index = gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), state->page);
+    if (window->active == state) window->active = NULL;
+    gtk_notebook_remove_page(GTK_NOTEBOOK(window->notebook), index);
+    dispose_document(state);
+    if (window->closing_window) quit_window(window);
+    else if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)) == 0) new_tab(window);
+}
+
+static void action_close_tab(GSimpleAction *action, GVariant *parameter) {
+    (void)parameter; tab_close_clicked(NULL, action_state(action));
+}
+
+static void action_cycle_tab(GSimpleAction *action, GVariant *parameter) {
+    (void)parameter;
+    AppState *window = window_state(action_state(action));
+    int count = gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook));
+    int current = gtk_notebook_get_current_page(GTK_NOTEBOOK(window->notebook));
+    int step = g_str_equal(g_action_get_name(G_ACTION(action)), "next-tab") ? 1 : -1;
+    if (count) gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook), (current + step + count) % count);
+}
+
+static void create_editor(AppState *state) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    state->page = g_object_ref_sink(root);
+    g_object_set_data(G_OBJECT(root), "document", state);
     state->loading_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     state->loading_label = gtk_label_new("Loading…");
     gtk_box_append(GTK_BOX(state->loading_bar), state->loading_label);
@@ -1517,13 +1768,15 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     state->view = GTK_SOURCE_VIEW(gtk_source_view_new_with_buffer(state->buffer));
     gtk_widget_add_css_class(GTK_WIDGET(state->view), "quillmote-editor");
-    GtkDropTarget *drop = gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
-    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(drop), GTK_PHASE_CAPTURE);
-    g_signal_connect(drop, "drop", G_CALLBACK(file_dropped), state);
-    gtk_widget_add_controller(state->window, GTK_EVENT_CONTROLLER(drop));
+    gchar *editor_name = g_strdup_printf("editor-%p", (void *)state);
+    gtk_widget_set_name(GTK_WIDGET(state->view), editor_name); g_free(editor_name);
     gtk_source_view_set_show_line_numbers(state->view, FALSE);
     gtk_source_view_set_highlight_current_line(state->view, TRUE);
     gtk_source_view_set_tab_width(state->view, 8);
+    gtk_source_buffer_set_implicit_trailing_newline(state->buffer, FALSE);
+    GtkSourceSpaceDrawer *drawer = gtk_source_view_get_space_drawer(state->view);
+    gtk_source_space_drawer_set_types_for_locations(drawer, GTK_SOURCE_SPACE_LOCATION_ALL, GTK_SOURCE_SPACE_TYPE_ALL);
+    gtk_source_space_drawer_set_enable_matrix(drawer, state->show_invisibles);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(state->view), state->word_wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     state->scroller = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(state->scroller), GTK_WIDGET(state->view));
@@ -1548,17 +1801,157 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_event_controller_set_propagation_phase(context_key, GTK_PHASE_CAPTURE);
     g_signal_connect(context_key, "key-pressed", G_CALLBACK(spelling_context_key), state);
     gtk_widget_add_controller(GTK_WIDGET(state->view), context_key);
+    GdkRGBA spell_color; gdk_rgba_parse(&spell_color, "#e33b3b");
+    gtk_text_buffer_create_tag(GTK_TEXT_BUFFER(state->buffer), "misspelled", "underline", PANGO_UNDERLINE_ERROR, "underline-rgba", &spell_color, NULL);
+    state->status = gtk_label_new(NULL);
+    gtk_label_set_ellipsize(GTK_LABEL(state->status), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(state->status, "quillmote-status"); gtk_label_set_xalign(GTK_LABEL(state->status), 0);
+    gtk_box_append(GTK_BOX(root), state->status); gtk_widget_set_visible(state->status, state->show_status);
+
+    g_signal_connect(state->buffer, "changed", G_CALLBACK(schedule_spell_scan), state);
+    g_signal_connect(state->buffer, "modified-changed", G_CALLBACK(modified_changed), state);
+    g_signal_connect(state->buffer, "mark-set", G_CALLBACK(cursor_moved), state);
+    GtkSettings *settings = gtk_settings_get_default();
+#if GTK_CHECK_VERSION(4, 20, 0)
+    g_signal_connect(settings, "notify::gtk-interface-color-scheme", G_CALLBACK(system_theme_changed), state);
+#endif
+    g_signal_connect(settings, "notify::gtk-theme-name", G_CALLBACK(system_theme_changed), state);
+    g_signal_connect(settings, "notify::gtk-application-prefer-dark-theme", G_CALLBACK(system_theme_changed), state);
+    system_theme_changed(settings, NULL, state);
+    update_title(state); update_status(state);
+    state->recovery_directory = g_build_filename(g_get_user_config_dir(), "quillmote", "recovery", NULL);
+    GError *recovery_error = NULL;
+    state->recovery = recovery_session_new(state->recovery_directory, &recovery_error);
+    if (!state->recovery) {
+        state->recovery_failed = TRUE; update_status(state);
+        g_warning("Crash recovery unavailable: %s", recovery_error->message); g_clear_error(&recovery_error);
+    }
+    setup_search(state); schedule_counts(state, TRUE);
+    state->recovery_timer = g_timeout_add_seconds(2, recovery_tick, state);
+}
+
+static AppState *new_tab(AppState *state) {
+    AppState *window = window_state(state);
+    if (window->closing_window) return active_state(state);
+    AppState *previous = window->active;
+    if (previous && !previous->disposed) save_preferences(previous);
+    AppState *tab = g_new0(AppState, 1);
+    tab->owner = window; tab->app = window->app; tab->window = window->window;
+    load_preferences(tab); enchant_setup(tab);
+    create_editor(tab); attach_tab(tab);
+    return tab;
+}
+
+static AppState *open_tab(AppState *state, const char *path, gboolean create, gboolean recover) {
+    AppState *window = window_state(state);
+    if (window->closing_window) return NULL;
+    gchar *canonical = g_canonicalize_filename(path, NULL);
+    if (!recover) for (guint i = 0; i < window->tabs->len; i++) {
+        AppState *tab = g_ptr_array_index(window->tabs, i);
+        if (tab->closed) continue;
+        const char *existing = tab->loading ? tab->loading->path : tab->filename;
+        if (existing) {
+            gchar *other = g_canonicalize_filename(existing, NULL);
+            gboolean same = g_str_equal(canonical, other); g_free(other);
+            if (same) { select_tab(tab); g_free(canonical); return tab; }
+        }
+    }
+    AppState *tab = window->active;
+    if (!tab || tab->closed || tab->loading || (tab->busy && !tab->file_dialog) || tab->filename ||
+        gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(tab->buffer)) || gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(tab->buffer)))
+        tab = new_tab(state);
+    if (!create && !recover) load_file(tab, canonical, -1);
+    else load_file_full(tab, canonical, -1, create, recover);
+    g_free(canonical);
+    return tab;
+}
+
+static void activate(GtkApplication *app, gpointer data) {
+    AppState *state = data;
+    if (state->window) { gtk_window_present(GTK_WINDOW(state->window)); return; }
+    state->app = app;
+    load_preferences(state);
+    enchant_setup(state);
+    state->window = gtk_application_window_new(app);
+    g_signal_connect(state->window, "close-request", G_CALLBACK(close_requested), state);
+    gtk_window_set_default_size(GTK_WINDOW(state->window), state->window_width, state->window_height);
+    if (state->maximized) gtk_window_maximize(GTK_WINDOW(state->window));
+    g_signal_connect(state->window, "notify::default-width", G_CALLBACK(remember_window), state);
+    g_signal_connect(state->window, "notify::default-height", G_CALLBACK(remember_window), state);
+    g_signal_connect(state->window, "notify::maximized", G_CALLBACK(remember_window), state);
+    gtk_window_set_titlebar(GTK_WINDOW(state->window), gtk_header_bar_new());
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_window_set_child(GTK_WINDOW(state->window), root);
+
+    GMenu *file = g_menu_new();
+    g_menu_append(file, "_New Tab", "app.new"); g_menu_append(file, "_Open...", "app.open");
+    g_menu_append(file, "_Save", "app.save"); g_menu_append(file, "Save _As...", "app.save-as");
+    g_menu_append(file, "Page Set_up...", "app.page-setup"); g_menu_append(file, "_Print...", "app.print"); g_menu_append(file, "Close _Tab", "app.close-tab"); g_menu_append(file, "E_xit", "app.quit");
+    GMenu *edit = g_menu_new();
+    g_menu_append(edit, "_Undo", "app.undo"); g_menu_append(edit, "_Redo", "app.redo");
+    g_menu_append(edit, "Cu_t", "app.cut"); g_menu_append(edit, "_Copy", "app.copy"); g_menu_append(edit, "_Paste", "app.paste");
+    g_menu_append(edit, "De_lete", "app.delete"); g_menu_append(edit, "_Find...", "app.find");
+    g_menu_append(edit, "Find _Next", "app.find-next"); g_menu_append(edit, "R_eplace...", "app.replace");
+    g_menu_append(edit, "_Go To...", "app.go-to"); g_menu_append(edit, "Select _All", "app.select-all"); g_menu_append(edit, "Time/_Date", "app.time-date");
+    GMenu *format = g_menu_new(); g_menu_append(format, "_Word Wrap", "app.wrap"); g_menu_append(format, "_Font...", "app.font");
+    GMenu *spelling = g_menu_new(), *languages = g_menu_new();
+    g_menu_append(spelling, "Check Spelling", "app.spell-enabled");
+    for (guint i = 0; i < state->spell_languages->len; i++) {
+        const char *tag = g_ptr_array_index(state->spell_languages, i);
+        gchar *label = g_strdup(tag); g_strdelimit(label, "_", '-');
+        GMenuItem *item = g_menu_item_new(label, NULL); g_free(label);
+        g_menu_item_set_action_and_target(item, "app.spell-language", "s", tag);
+        g_menu_append_item(languages, item); g_object_unref(item);
+    }
+    if (!state->spell_languages->len) g_menu_append(languages, "No dictionaries installed", NULL);
+    g_menu_append_submenu(spelling, "Language", G_MENU_MODEL(languages));
+    g_menu_append_submenu(format, "Spelling", G_MENU_MODEL(spelling));
+    g_object_unref(spelling); g_object_unref(languages);
+    GMenu *view = g_menu_new(); g_menu_append(view, "_Status Bar", "app.status-bar"); g_menu_append(view, "_Right-to-Left Reading Order", "app.rtl");
+    g_menu_append(view, "_Word Count", "app.word-count");
+    g_menu_append(view, "Show _Invisible Characters", "app.invisible-characters");
+    GMenu *zoom = g_menu_new();
+    g_menu_append(zoom, "Zoom In", "app.zoom-in"); g_menu_append(zoom, "Zoom Out", "app.zoom-out");
+    g_menu_append(zoom, "Reset Zoom", "app.zoom-reset");
+    g_menu_append_submenu(view, "Zoom", G_MENU_MODEL(zoom)); g_object_unref(zoom);
+    GMenu *help = g_menu_new(); g_menu_append(help, "View _Help", "app.help"); g_menu_append(help, "_About Quillmote", "app.about");
+    GMenu *menubar = g_menu_new();
+    g_menu_append_submenu(menubar, "_File", G_MENU_MODEL(file)); g_menu_append_submenu(menubar, "_Edit", G_MENU_MODEL(edit));
+    g_menu_append_submenu(menubar, "F_ormat", G_MENU_MODEL(format)); g_menu_append_submenu(menubar, "_View", G_MENU_MODEL(view)); g_menu_append_submenu(menubar, "_Help", G_MENU_MODEL(help));
+    GtkWidget *menu_bar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(menubar));
+    configure_menu_popovers(menu_bar);
+    gtk_box_append(GTK_BOX(root), menu_bar);
+    GtkEventController *escape = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(escape, GTK_PHASE_CAPTURE);
+    g_signal_connect(escape, "key-pressed", G_CALLBACK(menu_escape), state);
+    gtk_widget_add_controller(state->window, escape);
+    g_object_unref(file); g_object_unref(edit); g_object_unref(format); g_object_unref(view); g_object_unref(help); g_object_unref(menubar);
+
+    state->notebook = gtk_notebook_new();
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(state->notebook), TRUE);
+    GtkWidget *new_button = gtk_button_new_from_icon_name("list-add-symbolic");
+    gtk_widget_add_css_class(new_button, "flat");
+    gtk_widget_set_tooltip_text(new_button, "New tab (Ctrl+T)");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(new_button), GTK_ACCESSIBLE_PROPERTY_LABEL, "New tab", -1);
+    gtk_actionable_set_action_name(GTK_ACTIONABLE(new_button), "app.new");
+    gtk_notebook_set_action_widget(GTK_NOTEBOOK(state->notebook), new_button, GTK_PACK_END);
+    gtk_widget_set_vexpand(state->notebook, TRUE);
+    gtk_box_append(GTK_BOX(root), state->notebook);
+    state->tabs = g_ptr_array_new(); state->active = state;
+    create_editor(state);
+    attach_tab(state);
+    GtkDropTarget *drop = gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(drop), GTK_PHASE_CAPTURE);
+    g_signal_connect(drop, "drop", G_CALLBACK(file_dropped), state);
+    gtk_widget_add_controller(state->window, GTK_EVENT_CONTROLLER(drop));
     GSimpleAction *replace = g_simple_action_new("replace-spelling", G_VARIANT_TYPE("(tiiss)"));
     g_object_set_data(G_OBJECT(replace), "quillmote-state", state);
     g_signal_connect(replace, "activate", G_CALLBACK(replace_spelling), NULL);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(replace)); g_object_unref(replace);
-    GdkRGBA spell_color; gdk_rgba_parse(&spell_color, "#e33b3b");
-    gtk_text_buffer_create_tag(GTK_TEXT_BUFFER(state->buffer), "misspelled", "underline", PANGO_UNDERLINE_ERROR, "underline-rgba", &spell_color, NULL);
-    state->status = gtk_label_new(NULL);
-    gtk_widget_add_css_class(state->status, "quillmote-status"); gtk_label_set_xalign(GTK_LABEL(state->status), 0);
-    gtk_box_append(GTK_BOX(root), state->status); gtk_widget_set_visible(state->status, state->show_status);
-
     const struct { const char *name; GCallback callback; const char *shortcut; } actions[] = {
+        {"close-tab", G_CALLBACK(action_close_tab), "<Primary>w"},
+        {"next-tab", G_CALLBACK(action_cycle_tab), "<Primary>Tab"},
+        {"previous-tab", G_CALLBACK(action_cycle_tab), "<Primary><Shift>Tab"},
         {"zoom-in", G_CALLBACK(action_zoom), "<Primary>plus"},
         {"zoom-out", G_CALLBACK(action_zoom), "<Primary>minus"},
         {"zoom-reset", G_CALLBACK(action_zoom), "<Primary>0"},
@@ -1582,6 +1975,8 @@ static void activate(GtkApplication *app, gpointer data) {
             gtk_application_set_accels_for_action(app, name, keys); g_free(name);
         }
     }
+    const char *new_keys[] = {"<Primary>n", "<Primary>t", NULL};
+    gtk_application_set_accels_for_action(app, "app.new", new_keys);
     const char *zoom_in_keys[] = {"<Primary>plus", "<Primary>equal", "<Primary>KP_Add", NULL};
     const char *zoom_out_keys[] = {"<Primary>minus", "<Primary>KP_Subtract", NULL};
     const char *zoom_reset_keys[] = {"<Primary>0", "<Primary>KP_0", NULL};
@@ -1603,26 +1998,11 @@ static void activate(GtkApplication *app, gpointer data) {
     add_toggle(state, "wrap", state->word_wrap, G_CALLBACK(set_wrap_state));
     add_toggle(state, "status-bar", state->show_status, G_CALLBACK(set_status_state));
     add_toggle(state, "rtl", FALSE, G_CALLBACK(set_rtl_state));
-    g_signal_connect(state->buffer, "changed", G_CALLBACK(schedule_spell_scan), state);
-    g_signal_connect(state->buffer, "modified-changed", G_CALLBACK(modified_changed), state);
-    g_signal_connect(state->buffer, "mark-set", G_CALLBACK(cursor_moved), state);
-    GtkSettings *settings = gtk_settings_get_default();
-#if GTK_CHECK_VERSION(4, 20, 0)
-    g_signal_connect(settings, "notify::gtk-interface-color-scheme", G_CALLBACK(system_theme_changed), state);
-#endif
-    g_signal_connect(settings, "notify::gtk-theme-name", G_CALLBACK(system_theme_changed), state);
-    g_signal_connect(settings, "notify::gtk-application-prefer-dark-theme", G_CALLBACK(system_theme_changed), state);
-    system_theme_changed(settings, NULL, state);
-    update_title(state); update_status(state);
+    add_toggle(state, "word-count", state->show_word_count, G_CALLBACK(set_word_count_state));
+    add_toggle(state, "invisible-characters", state->show_invisibles, G_CALLBACK(set_invisibles_state));
+    sync_tab_actions(state);
+    g_signal_connect(state->notebook, "switch-page", G_CALLBACK(tab_switched), state);
     gtk_window_present(GTK_WINDOW(state->window)); gtk_widget_grab_focus(GTK_WIDGET(state->view));
-    state->recovery_directory = g_build_filename(g_get_user_config_dir(), "quillmote", "recovery", NULL);
-    GError *recovery_error = NULL;
-    state->recovery = recovery_session_new(state->recovery_directory, &recovery_error);
-    if (!state->recovery) {
-        state->recovery_failed = TRUE; update_status(state);
-        g_warning("Crash recovery unavailable: %s", recovery_error->message); g_clear_error(&recovery_error);
-    }
-    state->recovery_timer = g_timeout_add_seconds(2, recovery_tick, state);
     state->recovery_start_idle = g_idle_add(startup_recovery, state);
 }
 
@@ -1630,22 +2010,24 @@ static void open_files(GApplication *application, GFile **files, gint count, con
     (void)hint;
     AppState *state = data;
     activate(GTK_APPLICATION(application), state);
-    if (count != 1) {
-        GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Open one document per Quillmote window.");
-        show_error(state, "Could not open files", error); g_error_free(error); return;
+    for (int i = 0; i < count; i++) {
+        gchar *path = g_file_get_path(files[i]);
+        if (path) open_tab(state, path, TRUE, FALSE);
+        else {
+            GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
+            show_error(state, "Could not open file", error); g_error_free(error);
+        }
+        g_free(path);
     }
-    gchar *path = g_file_get_path(files[0]);
-    if (path) request_document_change(state, PENDING_CREATE, path);
-    else {
-        GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
-        show_error(state, "Could not open file", error); g_error_free(error);
-    }
-    g_free(path);
 }
 
-static void shutdown_app(GApplication *application, gpointer data) {
-    (void)application; AppState *state = data;
-    save_preferences(state);
+static void dispose_document(AppState *state) {
+    if (state->disposed) return;
+    state->disposed = TRUE;
+    if (state->count_idle) g_source_remove(state->count_idle);
+    if (state->search_idle) g_source_remove(state->search_idle);
+    g_clear_object(&state->search_context);
+    if (state->buffer) g_signal_handlers_disconnect_by_data(state->buffer, state);
     if (state->recovery_start_idle) g_source_remove(state->recovery_start_idle);
     if (state->recovery_timer) g_source_remove(state->recovery_timer);
     if (state->recovery_idle) g_source_remove(state->recovery_idle);
@@ -1659,12 +2041,23 @@ static void shutdown_app(GApplication *application, gpointer data) {
     g_clear_object(&state->spelling_menu);
     if (state->broker_free_dict && state->dictionary) state->broker_free_dict(state->broker, state->dictionary);
     if (state->broker_free && state->broker) state->broker_free(state->broker);
-    if (state->enchant_library) dlclose(state->enchant_library);
     if (state->css) gtk_style_context_remove_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->css));
     g_clear_object(&state->css);
     g_clear_object(&state->buffer);
     g_clear_pointer(&state->font, pango_font_description_free);
     g_free(state->filename);
+    g_clear_object(&state->page);
+}
+
+static void shutdown_app(GApplication *application, gpointer data) {
+    (void)application; AppState *state = data;
+    if (state->active && !state->active->disposed) save_preferences(state->active);
+    for (guint i = 0; state->tabs && i < state->tabs->len; i++) {
+        AppState *tab = g_ptr_array_index(state->tabs, i);
+        dispose_document(tab);
+        if (tab != state) g_free(tab);
+    }
+    g_clear_pointer(&state->tabs, g_ptr_array_unref);
 }
 
 int main(int argc, char **argv) {
