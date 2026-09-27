@@ -1743,6 +1743,7 @@ static void create_editor(AppState *state) {
     gtk_source_view_set_show_line_numbers(state->view, FALSE);
     gtk_source_view_set_highlight_current_line(state->view, TRUE);
     gtk_source_view_set_tab_width(state->view, 8);
+    gtk_source_view_set_auto_indent(state->view, TRUE);
     gtk_source_buffer_set_implicit_trailing_newline(state->buffer, FALSE);
     GtkSourceSpaceDrawer *drawer = gtk_source_view_get_space_drawer(state->view);
     gtk_source_space_drawer_set_types_for_locations(drawer, GTK_SOURCE_SPACE_LOCATION_ALL, GTK_SOURCE_SPACE_TYPE_ALL);

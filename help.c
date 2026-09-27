@@ -12,6 +12,7 @@ static const struct { const char *id, *title, *text; } topics[] = {
      "Ctrl+N or Ctrl+T creates a tab. Ctrl+W closes the current tab. Ctrl+Tab and Ctrl+Shift+Tab move between tabs. You can drag tab headers to reorder them, and hover a filename to see its full path.\n\n"
      "Each tab keeps its own undo history, cursor position, search, and view settings. Closing a modified tab asks whether to Save, Don't Save, or Cancel. Closing the last tab leaves a blank document. Ctrl+Q closes the window, checking each tab for unsaved changes.\n\n"
      "Ctrl+Z undoes an edit; Ctrl+Shift+Z redoes it. Ctrl+X, Ctrl+C, and Ctrl+V cut, copy, and paste. Ctrl+A selects all text.\n\n"
+     "Enter carries the current line's leading spaces and tabs onto the new line. Shift+Enter inserts a plain line break without copying indentation.\n\n"
      "Ctrl+G goes to a document line, including when word wrap is enabled. F5 inserts the current date and time. Files beginning with .LOG on their own first line receive a timestamp when opened."},
     {"search", "Find and replace",
      "Ctrl+F opens Find. Type your search to highlight matches and see their count. Enter or F3 selects the next match; the counter shows your position, such as 3 of 12.\n\n"

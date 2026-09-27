@@ -3,6 +3,7 @@
 ## 0.1.0 — initial public build preparation
 
 - Plain-text editing with tabs, independent undo histories, and drag-and-drop.
+- Enter continues the current line's spaces and tabs; Shift+Enter inserts an unindented line break.
 - Find and replace with highlighted matches, counts, and collapsible replacement controls.
 - Word and character counts, invisible-character display, and zoom.
 - Optional spelling with installed languages and contextual corrections.

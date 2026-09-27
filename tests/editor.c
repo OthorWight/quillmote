@@ -105,6 +105,37 @@ static void check_counts_search(AppState *state) {
     g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(state->search_count)), ==, "");
     close_find(NULL, state);
 }
+static void check_auto_indent(AppState *state) {
+    const struct { const char *before; int cursor; const char *after; } cases[] = {
+        {"    text", 8, "    text\n    "},
+        {"\t\ttext", 6, "\t\ttext\n\t\t"},
+        {" \t  text", 8, " \t  text\n \t  "},
+        {"    left right", 8, "    left\n    right"},
+        {"\t  ", 3, "\t  \n\t  "},
+        {"text", 4, "text\n"},
+        {"", 0, "\n"}
+    };
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
+    GtkSourceIndenter *indenter = gtk_source_view_get_indenter(state->view);
+    g_assert_true(gtk_source_view_get_auto_indent(state->view));
+    for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+        gtk_text_buffer_set_text(buffer, cases[i].before, -1);
+        select_range(state, cases[i].cursor, cases[i].cursor);
+        GtkTextIter iter;
+        gtk_text_buffer_get_iter_at_offset(buffer, &iter, cases[i].cursor);
+        gboolean indent = gtk_source_indenter_is_trigger(indenter, state->view, &iter, 0, GDK_KEY_Return);
+        g_assert_cmpint(gtk_source_indenter_is_trigger(indenter, state->view, &iter, 0, GDK_KEY_KP_Enter), ==, indent);
+        g_assert_false(gtk_source_indenter_is_trigger(indenter, state->view, &iter, GDK_SHIFT_MASK, GDK_KEY_Return));
+        /* Exercise the default indenter with the same post-newline iterator
+         * and user-action boundary supplied by GtkSourceView for Enter. */
+        gtk_text_buffer_begin_user_action(buffer);
+        gtk_text_buffer_insert(buffer, &iter, "\n", 1);
+        if (indent) gtk_source_indenter_indent(indenter, state->view, &iter);
+        gtk_text_buffer_end_user_action(buffer);
+        assert_text(state, cases[i].after);
+        gtk_text_buffer_undo(buffer); assert_text(state, cases[i].before);
+    }
+}
 static void check_tabs(AppState *root, const char *directory) {
     gtk_text_buffer_set_text(GTK_TEXT_BUFFER(root->buffer), "first draft", -1);
     select_range(root, 3, 3);
@@ -206,6 +237,7 @@ int main(int argc, char **argv) {
     action(&state, "close-tab"); answer(&state, "Don't Save");
     select_tab(&state);
     check_counts_search(&state);
+    check_auto_indent(&state);
     check_tabs(&state, directory);
     shutdown_app(G_APPLICATION(app), &state); g_object_unref(app); g_free(directory);
     g_print("Counts, invisible characters, search feedback, independent tabs, close/save/cancel, and multi-tab crash recovery passed.\n");
