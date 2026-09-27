@@ -2,13 +2,7 @@
 #include "../main.c"
 #undef main
 
-static void flush_events(void) {
-    gint64 deadline = g_get_monotonic_time() + 100 * G_TIME_SPAN_MILLISECOND;
-    do {
-        while (g_main_context_iteration(NULL, FALSE)) {}
-        g_usleep(1000);
-    } while (g_get_monotonic_time() < deadline);
-}
+#include "ui.h"
 
 static void wait_for_load(AppState *state) {
     gint64 deadline = g_get_monotonic_time() + 20 * G_TIME_SPAN_SECOND;
@@ -145,10 +139,10 @@ static void check_file_lifecycle(AppState *state, const char *directory) {
     g_assert_true(save_contents(state, path, ENCODING_UTF16_LE, ENDING_CRLF));
     g_assert_false(gtk_text_buffer_get_modified(buffer));
     gtk_text_buffer_set_text(buffer, "unsaved edit", -1);
-    request_document_change(state, PENDING_NEW, NULL);
+    request_document_change(state, PENDING_NEW);
     g_assert_true(state->busy); answer_prompt(state, "Cancel");
     assert_text(state, "unsaved edit"); g_assert_false(state->busy);
-    request_document_change(state, PENDING_NEW, NULL); answer_prompt(state, "Save");
+    request_document_change(state, PENDING_NEW); answer_prompt(state, "Save");
     assert_text(state, ""); g_assert_null(state->filename);
     g_assert_true(load_file(state, path, -1)); wait_for_load(state); buffer = GTK_TEXT_BUFFER(state->buffer); assert_text(state, "unsaved edit");
     g_assert_cmpint(state->encoding, ==, ENCODING_UTF16_LE);
@@ -156,7 +150,7 @@ static void check_file_lifecycle(AppState *state, const char *directory) {
     /* Failed conversion must not overwrite the file or continue New. */
     state->encoding = ENCODING_ANSI;
     gtk_text_buffer_set_text(buffer, "日本語", -1);
-    request_document_change(state, PENDING_NEW, NULL); answer_prompt(state, "Save");
+    request_document_change(state, PENDING_NEW); answer_prompt(state, "Save");
     assert_text(state, "日本語"); g_assert_cmpstr(state->filename, ==, path);
     g_assert_cmpint(state->pending, ==, PENDING_NONE);
     answer_prompt(state, "Close");
@@ -168,10 +162,10 @@ static void check_file_lifecycle(AppState *state, const char *directory) {
     g_signal_emit_by_name(state->file_dialog, "response", GTK_RESPONSE_CANCEL);
     flush_events();
     g_assert_cmpstr(state->filename, ==, path); assert_text(state, "keep this");
-    request_document_change(state, PENDING_NEW, NULL); answer_prompt(state, "Don't Save");
+    request_document_change(state, PENDING_NEW); answer_prompt(state, "Don't Save");
     assert_text(state, ""); g_assert_null(state->filename);
     gtk_text_buffer_set_text(buffer, "unnamed changes", -1);
-    request_document_change(state, PENDING_NEW, NULL); answer_prompt(state, "Save");
+    request_document_change(state, PENDING_NEW); answer_prompt(state, "Save");
     g_assert_nonnull(state->file_dialog); flush_events();
     g_signal_emit_by_name(state->file_dialog, "response", GTK_RESPONSE_CANCEL); flush_events();
     assert_text(state, "unnamed changes"); g_assert_cmpint(state->pending, ==, PENDING_NONE);
@@ -233,48 +227,26 @@ static void check_arbitrary_file(AppState *state, const char *directory) {
     gtk_text_buffer_get_start_iter(GTK_TEXT_BUFFER(state->buffer), &iter);
     g_assert_false(gtk_text_iter_has_tag(&iter, gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(GTK_TEXT_BUFFER(state->buffer)), "misspelled")));
     g_free(path);
-    request_document_change(state, PENDING_NEW, NULL);
+    request_document_change(state, PENDING_NEW);
     g_assert_cmpint(state->encoding, ==, ENCODING_UTF8);
 }
 
-static void capture(AppState *state, const char *directory, const char *name) {
-    flush_events();
-    GdkPaintable *paintable = gtk_widget_paintable_new(state->window);
-    GtkSnapshot *snapshot = gtk_snapshot_new();
-    int width = gtk_widget_get_width(state->window), height = gtk_widget_get_height(state->window);
-    gdk_paintable_snapshot(paintable, snapshot, width, height);
-    GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
-    for (int attempt = 0; !node && attempt < 20; attempt++) {
-        flush_events();
-        snapshot = gtk_snapshot_new();
-        gdk_paintable_snapshot(paintable, snapshot, width, height);
-        node = gtk_snapshot_free_to_node(snapshot);
-    }
-    g_assert_nonnull(node);
-    GskRenderer *renderer = gtk_native_get_renderer(GTK_NATIVE(state->window));
-    graphene_rect_t viewport = GRAPHENE_RECT_INIT(0, 0, width, height);
-    GdkTexture *texture = gsk_renderer_render_texture(renderer, node, &viewport);
-    gchar *path = g_build_filename(directory, name, NULL);
-    g_assert_true(gdk_texture_save_to_png(texture, path));
-    g_print("Screenshot: %s\n", path);
-    g_free(path); g_object_unref(texture); gsk_render_node_unref(node); g_object_unref(paintable);
-}
 
 int main(void) {
     GError *error = NULL;
     gchar *directory = g_dir_make_tmp("quillmote-features-XXXXXX", &error); g_assert_no_error(error);
     g_setenv("XDG_CONFIG_HOME", directory, TRUE);
-    gchar *legacy_directory = g_build_filename(directory, "notepad", NULL);
-    g_assert_cmpint(g_mkdir_with_parents(legacy_directory, 0700), ==, 0);
-    gchar *legacy_path = g_build_filename(legacy_directory, "settings.ini", NULL);
-    g_assert_true(g_file_set_contents(legacy_path, "[Editor]\nfont=Monospace 12\n[Print]\nheader=Legacy &f\n", -1, &error));
-    g_assert_no_error(error); g_free(legacy_directory); g_free(legacy_path);
+    gchar *settings_directory = g_build_filename(directory, "quillmote", NULL);
+    g_assert_cmpint(g_mkdir_with_parents(settings_directory, 0700), ==, 0);
+    gchar *settings_path = g_build_filename(settings_directory, "settings.ini", NULL);
+    g_assert_true(g_file_set_contents(settings_path, "[Editor]\nfont=Monospace 12\n[Print]\nheader=Notes &f\n", -1, &error));
+    g_assert_no_error(error); g_free(settings_directory); g_free(settings_path);
     gtk_init();
     AppState state = {0};
-    GtkApplication *app = gtk_application_new("com.example.Quillmote.FeatureTest", G_APPLICATION_NON_UNIQUE);
+    GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID ".FeatureTest", G_APPLICATION_NON_UNIQUE);
     g_assert_true(g_application_register(G_APPLICATION(app), NULL, &error)); g_assert_no_error(error);
     activate(app, &state); flush_events();
-    g_assert_cmpstr(state.printing.header, ==, "Legacy &f");
+    g_assert_cmpstr(state.printing.header, ==, "Notes &f");
     g_assert_nonnull(strstr(gtk_window_get_title(GTK_WINDOW(state.window)), "Quillmote"));
     check_search(&state);
     answer_prompt(&state, "Go To");
@@ -292,7 +264,7 @@ int main(void) {
     g_action_group_change_action_state(G_ACTION_GROUP(app), "status-bar", g_variant_new_boolean(TRUE));
     gtk_editable_set_text(GTK_EDITABLE(state.find_entry), "text");
     show_find(&state, TRUE);
-    capture(&state, directory, "quillmote.png");
+    capture_window(GTK_WINDOW(state.window), directory, "quillmote.png");
     close_find(NULL, &state);
     flush_events();
     while (state.recovery_writing || state.recovery_idle) g_main_context_iteration(NULL, TRUE);

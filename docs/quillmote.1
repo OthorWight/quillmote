@@ -1,0 +1,52 @@
+.TH QUILLMOTE 1 "September 2026" "Quillmote" "User Commands"
+.SH NAME
+quillmote \- a simple text editor for Linux
+.SH SYNOPSIS
+.B quillmote
+.RI [ OPTIONS ]
+.RI [ FILE ...]
+.SH DESCRIPTION
+Quillmote edits plain text in tabs, with find and replace, spelling,
+word counts, printing, and crash recovery. Its appearance follows the desktop.
+.PP
+Each supplied file opens in a separate tab. If a path does not exist,
+an empty document is opened with that filename; Save creates the file.
+The parent directory must exist. Each launch opens an independent window.
+Use \fB--\fR before filenames beginning with a dash.
+.SH OPTIONS
+.TP
+.BR \-v ", " \-\-version
+Print the application version and exit, without opening a display.
+.TP
+.BR \-h ", " \-\-help
+Show command-line usage and exit.
+.SH SHORTCUTS
+Ctrl+N or Ctrl+T creates a tab; Ctrl+O opens files; Ctrl+S saves;
+Ctrl+Shift+S opens Save As. Ctrl+W closes a tab and Ctrl+Q exits.
+Ctrl+Tab and Ctrl+Shift+Tab switch tabs.
+.PP
+Ctrl+F opens Find; Ctrl+H reveals Replace; F3 finds the next match.
+Escape closes Find. Ctrl+G goes to a line. F5 inserts the date and time.
+Ctrl++ and Ctrl+- zoom, and Ctrl+0 resets zoom. F1 opens the offline guide.
+.SH SPELLING
+Spell checking uses the optional Enchant 2 runtime and installed dictionaries.
+Select a dictionary under Format, Spelling, Language.
+Install extra dictionaries with the distribution's package manager, then restart.
+.SH FILES
+.TP
+.I ~/.config/quillmote/settings.ini
+Editor and window preferences.
+.TP
+.I ~/.config/quillmote/recovery/
+Private snapshots of unsaved documents. Snapshots do not overwrite original files.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Overrides the default configuration directory, ~/.config.
+.SH RECOVERY
+After an interrupted session, launching without files restores available snapshots
+in separate tabs. When opening a file, the Recover banner offers earlier unsaved work.
+Saving or explicitly discarding a document clears its snapshot.
+The latest edits may not have reached a snapshot; save regularly.
+.SH LICENSE
+MIT. GTK, GtkSourceView, Enchant, and dictionaries retain their own licenses.

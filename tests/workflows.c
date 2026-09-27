@@ -32,7 +32,7 @@ static void assert_text(AppState *state, const char *expected) {
 static GtkApplication *start(AppState *state) {
     gtk_init();
     static guint serial = 0;
-    gchar *id = g_strdup_printf("com.example.Quillmote.WorkflowTest%u", serial++);
+    gchar *id = g_strdup_printf(QUILLMOTE_APP_ID ".WorkflowTest%u", serial++);
     GtkApplication *app = gtk_application_new(id, G_APPLICATION_NON_UNIQUE); g_free(id);
     GError *error = NULL;
     g_assert_true(g_application_register(G_APPLICATION(app), NULL, &error)); g_assert_no_error(error);

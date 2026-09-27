@@ -4,3 +4,6 @@ tests/document
 tests/features
 tests/workflows
 tests/editor
+tests/help
+/build/
+/dist/

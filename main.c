@@ -6,10 +6,12 @@
 #include "document.h"
 #include "printing.h"
 #include "recovery.h"
+#include "help.h"
+#include "app-info.h"
 #include <glib/gstdio.h>
 #include <errno.h>
 
-typedef enum { PENDING_NONE, PENDING_NEW, PENDING_OPEN, PENDING_QUIT, PENDING_PATH, PENDING_CREATE, PENDING_RECOVER, PENDING_CLOSE } PendingAction;
+typedef enum { PENDING_NONE, PENDING_NEW, PENDING_QUIT, PENDING_CLOSE } PendingAction;
 
 typedef struct LoadJob LoadJob;
 typedef struct {
@@ -43,7 +45,6 @@ typedef struct AppState {
     TextEncoding encoding;
     LineEnding ending;
     PendingAction pending;
-    gchar *pending_path;
     gboolean busy, preferences_ready;
     gboolean word_wrap, show_status;
     PrintOptions printing;
@@ -182,7 +183,7 @@ static void show_error(AppState *state, const char *title, GError *error) {
 
 static void perform_pending(AppState *state);
 static void choose_file(AppState *state, gboolean save);
-static void request_document_change(AppState *state, PendingAction pending, const char *path);
+static void request_document_change(AppState *state, PendingAction pending);
 static void schedule_spell_scan(GtkTextBuffer *buffer, gpointer data);
 static void cursor_moved(GtkTextBuffer *buffer, GtkTextIter *location, GtkTextMark *mark, gpointer data);
 static void modified_changed(GtkTextBuffer *buffer, gpointer data);
@@ -286,7 +287,7 @@ static void load_finished(LoadJob *job, GError *error) {
     recovery_session_free(job->claimed);
     recovery_document_free(job->document);
     g_clear_object(&job->staging); g_free(job->path); g_free(job);
-    if (after != PENDING_NONE) request_document_change(state, after, NULL);
+    if (after != PENDING_NONE) request_document_change(state, after);
     g_application_release(G_APPLICATION(state->app));
 }
 
@@ -425,7 +426,6 @@ static void cancel_load(GtkButton *button, gpointer data) {
 static void cancel_pending(AppState *state) {
     window_state(state)->closing_window = FALSE;
     state->busy = FALSE; state->pending = PENDING_NONE;
-    g_clear_pointer(&state->pending_path, g_free);
 }
 
 /* GtkFileChooserNative supports encoding choices in the native file dialog. */
@@ -452,13 +452,11 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
         GFile *file = gtk_file_chooser_get_file(chooser);
         gchar *path = file ? g_file_get_path(file) : NULL;
         if (path) {
-            if (save) {
-                const char *choice = gtk_file_chooser_get_choice(chooser, "encoding");
-                TextEncoding encoding = choice ? g_ascii_strtoll(choice, NULL, 10) : state->encoding;
-                const char *line_choice = gtk_file_chooser_get_choice(chooser, "line-ending");
-                LineEnding ending = line_choice ? g_ascii_strtoll(line_choice, NULL, 10) : state->ending;
-                success = save_contents(state, path, encoding, ending);
-            } else { open_tab(state, path, FALSE, FALSE); success = TRUE; }
+            const char *choice = gtk_file_chooser_get_choice(chooser, "encoding");
+            TextEncoding encoding = choice ? g_ascii_strtoll(choice, NULL, 10) : state->encoding;
+            const char *line_choice = gtk_file_chooser_get_choice(chooser, "line-ending");
+            LineEnding ending = line_choice ? g_ascii_strtoll(line_choice, NULL, 10) : state->ending;
+            success = save_contents(state, path, encoding, ending);
         } else {
             GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
             show_error(state, "Could not access file", error); g_error_free(error);
@@ -529,10 +527,6 @@ static void perform_pending(AppState *state) {
         state->encoding = ENCODING_UTF8; state->ending = ENDING_LF;
         gtk_text_buffer_set_modified(buffer, FALSE);
         update_title(state); update_status(state);
-    } else if (pending == PENDING_OPEN) choose_file(state, FALSE);
-    else if (pending == PENDING_PATH || pending == PENDING_CREATE || pending == PENDING_RECOVER) {
-        load_file_full(state, state->pending_path, -1, pending == PENDING_CREATE, pending == PENDING_RECOVER);
-        g_clear_pointer(&state->pending_path, g_free);
     } else if (pending == PENDING_CLOSE || pending == PENDING_QUIT) {
         close_tab(state);
     }
@@ -548,13 +542,12 @@ static void unsaved_answer(GObject *source, GAsyncResult *result, gpointer data)
     else cancel_pending(state);
 }
 
-static void request_document_change(AppState *state, PendingAction pending, const char *path) {
+static void request_document_change(AppState *state, PendingAction pending) {
     if (state->loading && (pending == PENDING_QUIT || pending == PENDING_CLOSE)) {
         state->after_load = pending; g_cancellable_cancel(state->load_cancel); return;
     }
     if (state->busy) return;
     state->pending = pending;
-    g_free(state->pending_path); state->pending_path = g_strdup(path);
     if (!gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer))) { perform_pending(state); return; }
     state->busy = TRUE;
     gchar *name = state->filename ? g_path_get_basename(state->filename) : g_strdup("Untitled");
@@ -1122,30 +1115,12 @@ static void action_print(GSimpleAction *action, GVariant *parameter) {
 
 static void action_help(GSimpleAction *action, GVariant *parameter) {
     (void)parameter; AppState *state = action_state(action);
-    GtkAlertDialog *dialog = gtk_alert_dialog_new("Quillmote Help");
-    gtk_alert_dialog_set_detail(dialog,
-        "File: Ctrl+N or Ctrl+T New Tab, Ctrl+O Open, Ctrl+S Save, Ctrl+Shift+S Save As, Ctrl+P Print.\n"
-        "Tabs: Ctrl+W Close Tab, Ctrl+Tab Next, Ctrl+Shift+Tab Previous. Drag tabs to reorder.\n"
-        "Edit: Ctrl+Z Undo, Ctrl+Shift+Z Redo, Ctrl+X/C/V Cut/Copy/Paste, Ctrl+A Select All.\n"
-        "Search: Ctrl+F Find, F3 Find Next, Ctrl+H Replace, Ctrl+G Go To Line. Escape closes Find/Replace.\n"
-        "F5 inserts the current time and date. A file starting with .LOG on its own line gets a timestamp when opened.\n\n"
-        "Format chooses font, word wrap, and spelling language/on-off. View controls word counts, invisible characters, the status bar, reading order, and zoom. Appearance follows the system.\n"
-        "Zoom: Ctrl++ (or Ctrl+=), Ctrl+-, Ctrl+0 to reset. Zoom does not change the selected font or printing size.\n"
-        "Right-click an underlined word for suggestions, Add to Dictionary, or Ignore Word; Shift+F10 opens the same menu.\n\n"
-        "Drop a file onto the window to open it. Loading can be cancelled without losing the previous document.\n"
-        "Launch with a new filename to create a document; Save creates the file.\n"
-        "Unsaved work is periodically backed up for crash recovery. A normal launch restores it; when opening a file, use the Recover banner.\n\n"
-        "Open shows all files and detects the encoding automatically. Non-text files use a reversible raw-byte view.\n"
-        "Control bytes appear as symbols; saving a raw-byte view preserves those bytes.\n"
-        "Save As offers encoding choices. ANSI means Windows-1252; choose Unicode for other scripts.\n"
-        "Page Setup controls paper, orientation, margins, headers, and footers. Print uses the desktop print dialog, including Print to File/PDF where available.");
-    gtk_alert_dialog_show(dialog, GTK_WINDOW(state->window)); g_object_unref(dialog);
+    show_help(GTK_WINDOW(state->window));
 }
 
 static void action_about(GSimpleAction *action, GVariant *parameter) {
     (void)parameter; AppState *state = action_state(action);
-    gtk_show_about_dialog(GTK_WINDOW(state->window), "program-name", "Quillmote", "version", "1.0",
-        "comments", "A native plain-text editor inspired by Windows XP Notepad.\nBuilt with GTK and GtkSourceView.", NULL);
+    show_about(GTK_WINDOW(state->window));
 }
 
 static void system_theme_changed(GtkSettings *settings, GParamSpec *pspec, gpointer data) {
@@ -1376,11 +1351,6 @@ static void load_preferences(AppState *state) {
     print_options_init(&state->printing);
     GKeyFile *settings = g_key_file_new();
     gchar *path = preferences_path();
-    /* Preserve preferences from the app's former name on the first launch. */
-    if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
-        g_free(path);
-        path = g_build_filename(g_get_user_config_dir(), "notepad", "settings.ini", NULL);
-    }
     if (g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, NULL)) {
         gchar *font = g_key_file_get_string(settings, "Editor", "font", NULL);
         if (font) {
@@ -1683,7 +1653,7 @@ static void tab_close_clicked(GtkButton *button, gpointer data) {
     (void)button; AppState *state = data;
     if (state->closed || window_state(state)->closing_window) return;
     select_tab(state);
-    request_document_change(state, PENDING_CLOSE, NULL);
+    request_document_change(state, PENDING_CLOSE);
 }
 
 static void attach_tab(AppState *state) {
@@ -1717,7 +1687,7 @@ static void quit_window(AppState *state) {
         gtk_window_destroy(GTK_WINDOW(window->window)); return;
     }
     AppState *tab = window->active;
-    request_document_change(tab, PENDING_QUIT, NULL);
+    request_document_change(tab, PENDING_QUIT);
 }
 
 static void close_tab(AppState *state) {
@@ -1870,6 +1840,8 @@ static void activate(GtkApplication *app, gpointer data) {
     AppState *state = data;
     if (state->window) { gtk_window_present(GTK_WINDOW(state->window)); return; }
     state->app = app;
+    gtk_icon_theme_add_resource_path(gtk_icon_theme_get_for_display(gdk_display_get_default()), "/org/quillmote/Quillmote/icons");
+    gtk_window_set_default_icon_name(QUILLMOTE_APP_ID);
     load_preferences(state);
     enchant_setup(state);
     state->window = gtk_application_window_new(app);
@@ -2035,7 +2007,6 @@ static void dispose_document(AppState *state) {
     recovery_session_free(state->recovery); g_free(state->recovery_directory);
     g_clear_pointer(&state->spell_languages, g_ptr_array_unref); g_free(state->spell_language);
     print_options_clear(&state->printing);
-    g_clear_pointer(&state->pending_path, g_free);
     g_signal_handlers_disconnect_by_data(gtk_settings_get_default(), state);
     if (state->spell_idle) g_source_remove(state->spell_idle);
     g_clear_object(&state->spelling_menu);
@@ -2060,10 +2031,26 @@ static void shutdown_app(GApplication *application, gpointer data) {
     g_clear_pointer(&state->tabs, g_ptr_array_unref);
 }
 
+static gint handle_local_options(GApplication *application, GVariantDict *options, gpointer data) {
+    (void)application; (void)data;
+    if (g_variant_dict_contains(options, "version")) {
+        g_print("%s %s\n", QUILLMOTE_NAME, QUILLMOTE_VERSION); return 0;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
-    g_set_application_name("Quillmote");
+    g_set_application_name(QUILLMOTE_NAME);
     AppState state = {0};
-    GtkApplication *app = gtk_application_new("com.example.Quillmote", G_APPLICATION_HANDLES_OPEN | G_APPLICATION_NON_UNIQUE);
+    GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID, G_APPLICATION_HANDLES_OPEN | G_APPLICATION_NON_UNIQUE);
+    g_application_set_option_context_parameter_string(G_APPLICATION(app), "[FILE…]");
+    g_application_set_option_context_summary(G_APPLICATION(app), QUILLMOTE_SUMMARY);
+    g_application_set_option_context_description(G_APPLICATION(app),
+        "Open files in separate tabs. A missing filename starts an empty document; Save creates the file.\n"
+        "Use F1 inside the editor for the full guide and keyboard shortcuts.");
+    g_application_add_main_option(G_APPLICATION(app), "version", 'v', G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE,
+                                  "Show the application version", NULL);
+    g_signal_connect(app, "handle-local-options", G_CALLBACK(handle_local_options), NULL);
     g_signal_connect(app, "open", G_CALLBACK(open_files), &state);
     g_signal_connect(app, "activate", G_CALLBACK(activate), &state); g_signal_connect(app, "shutdown", G_CALLBACK(shutdown_app), &state);
     int status = g_application_run(G_APPLICATION(app), argc, argv);

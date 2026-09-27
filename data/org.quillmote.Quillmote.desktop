@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Quillmote
+GenericName=Text Editor
+Comment=Write and edit plain text with tabs, spelling, and crash recovery
+Exec=quillmote %F
+TryExec=quillmote
+Icon=org.quillmote.Quillmote
+Terminal=false
+Categories=Utility;TextEditor;GTK;
+MimeType=text/plain;
+Keywords=text;editor;notes;writing;
+StartupNotify=true

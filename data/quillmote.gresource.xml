@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/quillmote/Quillmote/icons/scalable/apps">
+    <file>org.quillmote.Quillmote.svg</file>
+  </gresource>
+</gresources>

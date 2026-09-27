@@ -203,7 +203,7 @@ int main(void) {
     g_setenv("XDG_CONFIG_HOME", test_directory, TRUE);
     gtk_init();
     AppState state = {0};
-    GtkApplication *app = gtk_application_new("com.example.Quillmote.AppearanceTest", G_APPLICATION_NON_UNIQUE);
+    GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID ".AppearanceTest", G_APPLICATION_NON_UNIQUE);
     GError *error = NULL;
     g_assert_true(g_application_register(G_APPLICATION(app), NULL, &error));
     g_assert_no_error(error);

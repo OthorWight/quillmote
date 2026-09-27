@@ -3,10 +3,7 @@
 #undef main
 #include <signal.h>
 
-static void flush_events(void) {
-    gint64 deadline = g_get_monotonic_time() + 100 * G_TIME_SPAN_MILLISECOND;
-    do { g_main_context_iteration(NULL, FALSE); g_usleep(1000); } while (g_get_monotonic_time() < deadline);
-}
+#include "ui.h"
 static void spin(void) { g_main_context_iteration(NULL, FALSE); g_usleep(100); }
 static void settle(AppState *state) {
     AppState *window = window_state(state);
@@ -25,7 +22,7 @@ static void settle(AppState *state) {
 }
 static GtkApplication *start(AppState *state) {
     gtk_init();
-    GtkApplication *app = gtk_application_new("com.example.Quillmote.EditorTest", G_APPLICATION_NON_UNIQUE);
+    GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID ".EditorTest", G_APPLICATION_NON_UNIQUE);
     g_assert_true(g_application_register(G_APPLICATION(app), NULL, NULL));
     activate(app, state); settle(state); return app;
 }
@@ -68,29 +65,6 @@ static void answer(AppState *state, const char *label) {
     } while (g_get_monotonic_time() < deadline);
     g_error("Missing dialog button: %s", label);
 }
-static void capture(AppState *state, const char *directory, const char *name) {
-    flush_events();
-    GdkPaintable *paintable = gtk_widget_paintable_new(state->window);
-    GtkSnapshot *snapshot = gtk_snapshot_new();
-    int width = gtk_widget_get_width(state->window), height = gtk_widget_get_height(state->window);
-    gdk_paintable_snapshot(paintable, snapshot, width, height);
-    GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
-    for (int attempt = 0; !node && attempt < 20; attempt++) {
-        flush_events();
-        snapshot = gtk_snapshot_new();
-        gdk_paintable_snapshot(paintable, snapshot, width, height);
-        node = gtk_snapshot_free_to_node(snapshot);
-    }
-    g_assert_nonnull(node);
-    GskRenderer *renderer = gtk_native_get_renderer(GTK_NATIVE(state->window));
-    graphene_rect_t viewport = GRAPHENE_RECT_INIT(0, 0, width, height);
-    GdkTexture *texture = gsk_renderer_render_texture(renderer, node, &viewport);
-    gchar *path = g_build_filename(directory, name, NULL);
-    g_assert_true(gdk_texture_save_to_png(texture, path));
-    g_print("Screenshot: %s\n", path);
-    g_free(path); g_object_unref(texture); gsk_render_node_unref(node); g_object_unref(paintable);
-}
-
 static void check_counts_search(AppState *state) {
     const char *text = "café can't 123\nHola\t世界 e\314\201  !";
     gtk_text_buffer_set_text(GTK_TEXT_BUFFER(state->buffer), text, -1); settle(state);
@@ -174,7 +148,7 @@ static void check_tabs(AppState *root, const char *directory) {
     g_action_group_change_action_state(G_ACTION_GROUP(root->app), "invisible-characters", g_variant_new_boolean(TRUE));
     settle(root); flush_events();
     g_assert_false(pango_layout_is_ellipsized(gtk_label_get_layout(GTK_LABEL(last->tab_label))));
-    capture(root, directory, "tabs-search-counts.png");
+    capture_window(GTK_WINDOW(root->window), directory, "tabs-search-counts.png");
     GValue drop = G_VALUE_INIT; g_value_init(&drop, GDK_TYPE_FILE_LIST);
     g_value_take_boxed(&drop, gdk_file_list_new_from_array(files, 2));
     g_assert_true(file_dropped(NULL, &drop, 0, 0, root)); settle(root);
