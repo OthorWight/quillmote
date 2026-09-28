@@ -194,12 +194,34 @@ static void check_tabs(AppState *root, const char *directory) {
     select_tab(last); action(root, "close-tab"); g_assert_true(last->closed);
     action(root, "close-tab"); /* Other saved file. */
     g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->notebook)), ==, 1);
+    /* Force a new revision: the periodic writer may have saved the old one.
+     * Start the worker without dispatching its completion before close. */
+    gtk_text_buffer_insert_at_cursor(GTK_TEXT_BUFFER(root->buffer), " pending recovery", -1);
     recovery_tick(root);
-    while (!root->recovery_writing) spin();
+    g_assert_cmpuint(root->recovery_idle, !=, 0);
+    g_source_remove(root->recovery_idle);
+    while (snapshot_chunk(root) == G_SOURCE_CONTINUE) {}
+    g_assert_true(root->recovery_writing);
     action(root, "close-tab"); answer(root, "Don't Save");
     g_assert_true(root->closed);
     g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->notebook)), ==, 1);
     assert_text(active_state(root), "");
+    /* Discard a tab while the snapshot worker still owns its copy. Its callback
+     * must release the copy without recreating recovery for the closed tab. */
+    AppState *writing = new_tab(root);
+    gtk_text_buffer_set_text(GTK_TEXT_BUFFER(writing->buffer), "Discard this snapshot", -1);
+    gchar *snapshot_path = g_strdup(writing->recovery->path);
+    recovery_tick(writing);
+    g_assert_cmpuint(writing->recovery_idle, !=, 0);
+    g_source_remove(writing->recovery_idle);
+    while (snapshot_chunk(writing) == G_SOURCE_CONTINUE) {}
+    close_tab(writing);
+    g_assert_true(writing->recovery_writing);
+    g_assert_null(writing->buffer);
+    settle(root);
+    g_assert_false(writing->recovery_writing);
+    g_assert_false(g_file_test(snapshot_path, G_FILE_TEST_EXISTS));
+    g_free(snapshot_path);
     action(root, "quit"); settle(root);
     g_assert_null(root->active);
     g_free(one); g_free(two);

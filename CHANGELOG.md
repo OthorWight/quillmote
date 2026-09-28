@@ -8,6 +8,8 @@
 - Word and character counts, invisible-character display, and zoom.
 - Optional spelling with installed languages and contextual corrections.
 - Background file loading, multiple encodings, and reversible raw-byte display.
+- Clear closed documents and undo history even when GTK retains a selection buffer.
+- Return unused heap pages to the OS after closing tabs on glibc systems, including after pending recovery writes finish.
 - Crash recovery, printing, and saved appearance preferences.
 - Grouped menus with native shortcut hints and tab navigation commands.
 - Offline help, version reporting, desktop launcher, icon, and installation targets.

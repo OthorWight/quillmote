@@ -16,7 +16,7 @@ GTK_LIBS = $(shell $(PKG_CONFIG) --libs gtksourceview-5)
 SUPPORT_SOURCES := document.c printing.c recovery.c help.c build/resources.c
 HEADERS := document.h printing.h recovery.h help.h app-info.h
 OBJECTS := build/main.o build/document.o build/printing.o build/recovery.o build/help.o build/resources.o
-GUI_TESTS := tests/appearance tests/features tests/workflows tests/editor tests/help
+GUI_TESTS := tests/appearance tests/features tests/workflows tests/editor tests/help tests/memory
 TESTS := tests/document $(GUI_TESTS)
 DIST_FILES := Makefile README.md LICENSE CHANGELOG.md CONTRIBUTING.md app-info.h main.c document.c document.h printing.c printing.h recovery.c recovery.h help.c help.h .gitignore data docs tests/*.c tests/*.h tools/*.sh
 

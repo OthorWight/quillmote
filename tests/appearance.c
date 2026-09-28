@@ -212,12 +212,21 @@ static void check_visible_shortcuts(AppState *state, const char *directory) {
     check_menu_shortcuts(model, state->app, &hints);
     g_assert_cmpuint(hints, ==, 25);
     GtkWidget *file = gtk_widget_get_first_child(bar);
-    g_assert_true(gtk_widget_activate(file)); flush_events();
     GtkWidget *save = menu_button_with_text(bar, "Save");
     g_assert_nonnull(save);
+    /* Screenshot popups must also map when the desktop keeps focus in another
+     * application. Restore normal grabbing behavior for the lifecycle tests. */
+    GtkPopover *file_popup = GTK_POPOVER(gtk_widget_get_ancestor(save, GTK_TYPE_POPOVER));
+    gtk_popover_set_autohide(file_popup, FALSE);
+    g_assert_true(gtk_widget_activate(file)); flush_events();
     assert_rendered_shortcut(save, "<Primary>s");
     capture_menu(save, directory, "file-menu.png");
     g_assert_true(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state)); flush_events();
+    gtk_popover_set_autohide(file_popup, TRUE);
+    GtkWidget *undo = menu_button_with_text(bar, "Undo");
+    g_assert_nonnull(undo);
+    GtkPopover *edit_popup = GTK_POPOVER(gtk_widget_get_ancestor(undo, GTK_TYPE_POPOVER));
+    gtk_popover_set_autohide(edit_popup, FALSE);
     g_assert_true(gtk_widget_activate(gtk_widget_get_next_sibling(file))); flush_events();
     const struct { const char *label, *action, *key; } editing[] = {
         {"Undo", "app.undo", "<Primary>z"}, {"Redo", "app.redo", "<Primary><Shift>z"},
@@ -233,8 +242,9 @@ static void check_visible_shortcuts(AppState *state, const char *directory) {
         gchar **keys = gtk_application_get_accels_for_action(state->app, editing[i].action);
         g_assert_null(keys[0]); g_strfreev(keys);
     }
-    capture_menu(menu_button_with_text(bar, "Undo"), directory, "edit-menu.png");
+    capture_menu(undo, directory, "edit-menu.png");
     g_assert_true(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state)); flush_events();
+    gtk_popover_set_autohide(edit_popup, TRUE);
     g_print("Menu shortcut hints, grouping, and native editing bindings passed.\n");
 }
 

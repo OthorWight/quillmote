@@ -10,6 +10,31 @@
 #include "app-info.h"
 #include <glib/gstdio.h>
 #include <errno.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+#ifdef __GLIBC__
+static guint memory_release_idle;
+
+static gboolean release_unused_memory(gpointer data) {
+    (void)data;
+    memory_release_idle = 0;
+    /* Text buffers contain many small allocations. Freeing them need not return
+     * their heap pages to the OS until we ask the allocator to trim its arenas. */
+    malloc_trim(0);
+    return G_SOURCE_REMOVE;
+}
+#endif
+
+static void queue_memory_release(void) {
+#ifdef __GLIBC__
+    /* Run after widget cleanup, coalescing a batch of tab closures. No document
+     * pointer is kept alive, and other allocators retain their normal policy. */
+    if (!memory_release_idle)
+        memory_release_idle = g_idle_add(release_unused_memory, NULL);
+#endif
+}
 
 typedef enum { PENDING_NONE, PENDING_NEW, PENDING_QUIT, PENDING_CLOSE } PendingAction;
 
@@ -1565,6 +1590,8 @@ static void snapshot_written(GObject *source, GAsyncResult *result, gpointer dat
     g_free(temporary); g_clear_error(&error);
     recovery_document_free(job->document); g_free(job->path); g_free(job);
     state->recovery_writing = FALSE;
+    /* A writer already running at close owns its snapshot until it finishes. */
+    if (state->closed) queue_memory_release();
     g_application_release(G_APPLICATION(state->app));
 }
 
@@ -1698,6 +1725,7 @@ static void close_tab(AppState *state) {
     if (window->active == state) window->active = NULL;
     gtk_notebook_remove_page(GTK_NOTEBOOK(window->notebook), index);
     dispose_document(state);
+    queue_memory_release();
     if (window->closing_window) quit_window(window);
     else if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)) == 0) new_tab(window);
 }
@@ -2081,10 +2109,17 @@ static void dispose_document(AppState *state) {
     if (state->broker_free && state->broker) state->broker_free(state->broker);
     if (state->css) gtk_style_context_remove_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->css));
     g_clear_object(&state->css);
+    g_clear_object(&state->page);
+    if (state->buffer) {
+        /* GTK's primary-selection provider can retain a buffer after its view
+         * is gone. Release the document and undo data even in that case. Do it
+         * after view teardown to avoid laying out a document being discarded. */
+        gtk_text_buffer_set_enable_undo(GTK_TEXT_BUFFER(state->buffer), FALSE);
+        gtk_text_buffer_set_text(GTK_TEXT_BUFFER(state->buffer), "", 0);
+    }
     g_clear_object(&state->buffer);
     g_clear_pointer(&state->font, pango_font_description_free);
     g_free(state->filename);
-    g_clear_object(&state->page);
 }
 
 static void shutdown_app(GApplication *application, gpointer data) {
