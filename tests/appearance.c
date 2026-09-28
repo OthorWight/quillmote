@@ -136,6 +136,108 @@ static GtkWidget *menu_button_with_text(GtkWidget *widget, const char *text) {
     return NULL;
 }
 
+static void assert_same_shortcut(const char *actual, const char *expected) {
+    guint actual_key, expected_key;
+    GdkModifierType actual_mods, expected_mods;
+    g_assert_true(gtk_accelerator_parse(actual, &actual_key, &actual_mods));
+    g_assert_true(gtk_accelerator_parse(expected, &expected_key, &expected_mods));
+    g_assert_cmpuint(actual_key, ==, expected_key);
+    g_assert_cmpuint(actual_mods, ==, expected_mods);
+}
+
+static void check_menu_shortcuts(GMenuModel *menu, GtkApplication *app, guint *hints) {
+    for (int i = 0; i < g_menu_model_get_n_items(menu); i++) {
+        gchar *action = NULL, *accel = NULL;
+        g_menu_model_get_item_attribute(menu, i, G_MENU_ATTRIBUTE_ACTION, "s", &action);
+        g_menu_model_get_item_attribute(menu, i, "accel", "s", &accel);
+        if (action) {
+            gchar **keys = gtk_application_get_accels_for_action(app, action);
+            if (keys[0]) {
+                g_assert_nonnull(accel);
+                assert_same_shortcut(accel, keys[0]);
+            }
+            if (accel) (*hints)++;
+            g_strfreev(keys);
+        }
+        g_free(action); g_free(accel);
+        const char *links[] = {G_MENU_LINK_SECTION, G_MENU_LINK_SUBMENU};
+        for (guint j = 0; j < G_N_ELEMENTS(links); j++) {
+            GMenuModel *child = g_menu_model_get_item_link(menu, i, links[j]);
+            if (child) { check_menu_shortcuts(child, app, hints); g_object_unref(child); }
+        }
+    }
+}
+
+static GtkWidget *find_label(GtkWidget *widget, const char *text) {
+    if (GTK_IS_LABEL(widget) && g_strcmp0(gtk_label_get_text(GTK_LABEL(widget)), text) == 0) return widget;
+    for (GtkWidget *child = gtk_widget_get_first_child(widget); child; child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *found = find_label(child, text);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static void assert_rendered_shortcut(GtkWidget *button, const char *shortcut) {
+    guint key; GdkModifierType mods;
+    g_assert_true(gtk_accelerator_parse(shortcut, &key, &mods));
+    gchar *label = gtk_accelerator_get_label(key, mods);
+    GtkWidget *hint = find_label(button, label);
+    g_assert_nonnull(hint);
+    for (int i = 0; i < 20 && !gtk_widget_get_mapped(hint); i++) flush_events();
+    g_assert_true(gtk_widget_get_mapped(hint));
+    g_free(label);
+}
+
+static void capture_menu(GtkWidget *button, const char *directory, const char *name) {
+    GtkWidget *popup = gtk_widget_get_ancestor(button, GTK_TYPE_POPOVER);
+    g_assert_nonnull(popup);
+    GdkPaintable *paintable = gtk_widget_paintable_new(popup);
+    GtkSnapshot *snapshot = gtk_snapshot_new();
+    int width = gtk_widget_get_width(popup), height = gtk_widget_get_height(popup);
+    gdk_paintable_snapshot(paintable, snapshot, width, height);
+    GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
+    g_assert_nonnull(node);
+    graphene_rect_t viewport = GRAPHENE_RECT_INIT(0, 0, width, height);
+    GdkTexture *texture = gsk_renderer_render_texture(gtk_native_get_renderer(GTK_NATIVE(popup)), node, &viewport);
+    gchar *path = g_build_filename(directory, name, NULL);
+    g_assert_true(gdk_texture_save_to_png(texture, path));
+    g_print("Menu screenshot: %s\n", path);
+    g_free(path); g_object_unref(texture); gsk_render_node_unref(node); g_object_unref(paintable);
+}
+
+static void check_visible_shortcuts(AppState *state, const char *directory) {
+    GtkWidget *bar = gtk_widget_get_first_child(gtk_window_get_child(GTK_WINDOW(state->window)));
+    GMenuModel *model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(bar));
+    guint hints = 0;
+    check_menu_shortcuts(model, state->app, &hints);
+    g_assert_cmpuint(hints, ==, 25);
+    GtkWidget *file = gtk_widget_get_first_child(bar);
+    g_assert_true(gtk_widget_activate(file)); flush_events();
+    GtkWidget *save = menu_button_with_text(bar, "Save");
+    g_assert_nonnull(save);
+    assert_rendered_shortcut(save, "<Primary>s");
+    capture_menu(save, directory, "file-menu.png");
+    g_assert_true(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state)); flush_events();
+    g_assert_true(gtk_widget_activate(gtk_widget_get_next_sibling(file))); flush_events();
+    const struct { const char *label, *action, *key; } editing[] = {
+        {"Undo", "app.undo", "<Primary>z"}, {"Redo", "app.redo", "<Primary><Shift>z"},
+        {"Cut", "app.cut", "<Primary>x"}, {"Copy", "app.copy", "<Primary>c"},
+        {"Paste", "app.paste", "<Primary>v"}, {"Delete", "app.delete", "Delete"},
+        {"Select All", "app.select-all", "<Primary>a"}
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(editing); i++) {
+        GtkWidget *button = menu_button_with_text(bar, editing[i].label);
+        g_assert_nonnull(button);
+        assert_rendered_shortcut(button, editing[i].key);
+        /* These must remain native widget bindings, including inside Find entries. */
+        gchar **keys = gtk_application_get_accels_for_action(state->app, editing[i].action);
+        g_assert_null(keys[0]); g_strfreev(keys);
+    }
+    capture_menu(menu_button_with_text(bar, "Undo"), directory, "edit-menu.png");
+    g_assert_true(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state)); flush_events();
+    g_print("Menu shortcut hints, grouping, and native editing bindings passed.\n");
+}
+
 static void assert_editor_focus(AppState *state) {
     GPtrArray *menus = g_ptr_array_new_with_free_func(g_object_unref);
     collect_open_menus(state->window, menus);
@@ -225,7 +327,14 @@ int main(void) {
     g_assert_null(g_action_map_lookup_action(G_ACTION_MAP(app), "dark-mode"));
     g_assert_null(g_action_map_lookup_action(G_ACTION_MAP(app), "correct"));
     GMenuModel *edit = g_menu_model_get_item_link(menu, 1, G_MENU_LINK_SUBMENU);
-    g_assert_cmpint(g_menu_model_get_n_items(edit), ==, 12);
+    g_assert_cmpint(g_menu_model_get_n_items(edit), ==, 4);
+    const int group_sizes[] = {2, 5, 4, 1};
+    for (int i = 0; i < 4; i++) {
+        GMenuModel *section = g_menu_model_get_item_link(edit, i, G_MENU_LINK_SECTION);
+        g_assert_nonnull(section);
+        g_assert_cmpint(g_menu_model_get_n_items(section), ==, group_sizes[i]);
+        g_object_unref(section);
+    }
     g_object_unref(edit);
     g_free(font_action);
     g_object_unref(format);
@@ -260,6 +369,7 @@ int main(void) {
         g_free(text);
     }
 
+    check_visible_shortcuts(&state, test_directory);
     check_spelling(&state);
     check_menu_lifecycle(&state);
     pango_font_description_free(rendered_font);

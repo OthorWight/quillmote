@@ -9,4 +9,5 @@
 - Optional spelling with installed languages and contextual corrections.
 - Background file loading, multiple encodings, and reversible raw-byte display.
 - Crash recovery, printing, and saved appearance preferences.
+- Grouped menus with native shortcut hints and tab navigation commands.
 - Offline help, version reporting, desktop launcher, icon, and installation targets.

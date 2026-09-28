@@ -9,7 +9,7 @@ static const struct { const char *id, *title, *text; } topics[] = {
      "Ctrl+S saves the active document. Ctrl+Shift+S opens Save As, where you can change the filename, encoding, and line endings. A star beside the filename means you have unsaved changes.\n\n"
      "Launching quillmote new-file.txt opens an empty document if that file does not exist. Save creates it; its parent folder must already exist."},
     {"tabs", "Tabs and editing",
-     "Ctrl+N or Ctrl+T creates a tab. Ctrl+W closes the current tab. Ctrl+Tab and Ctrl+Shift+Tab move between tabs. You can drag tab headers to reorder them, and hover a filename to see its full path.\n\n"
+     "Ctrl+T or Ctrl+N creates a tab. Ctrl+W closes the current tab. Ctrl+Tab and Ctrl+Shift+Tab move between tabs; these commands are also in the View menu. You can drag tab headers to reorder them, and hover a filename to see its full path.\n\n"
      "Each tab keeps its own undo history, cursor position, search, and view settings. Closing a modified tab asks whether to Save, Don't Save, or Cancel. Closing the last tab leaves a blank document. Ctrl+Q closes the window, checking each tab for unsaved changes.\n\n"
      "Ctrl+Z undoes an edit; Ctrl+Shift+Z redoes it. Ctrl+X, Ctrl+C, and Ctrl+V cut, copy, and paste. Ctrl+A selects all text.\n\n"
      "Enter carries the current line's leading spaces and tabs onto the new line. Shift+Enter inserts a plain line break without copying indentation.\n\n"

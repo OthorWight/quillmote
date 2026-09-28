@@ -1837,6 +1837,64 @@ static AppState *open_tab(AppState *state, const char *path, gboolean create, gb
     return tab;
 }
 
+/* The first shortcut is the menu hint. Editing shortcuts belong to the focused
+ * GTK text widget, so advertising them must not install application bindings. */
+static const struct {
+    const char *name;
+    GCallback callback;
+    const char *keys[4];
+    gboolean widget_binding;
+} commands[] = {
+    {"new", G_CALLBACK(action_new), {"<Primary>t", "<Primary>n"}, FALSE},
+    {"open", G_CALLBACK(action_open), {"<Primary>o"}, FALSE},
+    {"save", G_CALLBACK(action_save), {"<Primary>s"}, FALSE},
+    {"save-as", G_CALLBACK(action_save_as), {"<Primary><Shift>s"}, FALSE},
+    {"page-setup", G_CALLBACK(action_page_setup), {NULL}, FALSE},
+    {"print", G_CALLBACK(action_print), {"<Primary>p"}, FALSE},
+    {"close-tab", G_CALLBACK(action_close_tab), {"<Primary>w"}, FALSE},
+    {"quit", G_CALLBACK(action_quit), {"<Primary>q"}, FALSE},
+    {"undo", G_CALLBACK(action_undo), {"<Primary>z"}, TRUE},
+    {"redo", G_CALLBACK(action_redo), {"<Primary><Shift>z"}, TRUE},
+    {"cut", G_CALLBACK(action_cut), {"<Primary>x"}, TRUE},
+    {"copy", G_CALLBACK(action_copy), {"<Primary>c"}, TRUE},
+    {"paste", G_CALLBACK(action_paste), {"<Primary>v"}, TRUE},
+    {"delete", G_CALLBACK(action_delete), {"Delete"}, TRUE},
+    {"select-all", G_CALLBACK(action_select_all), {"<Primary>a"}, TRUE},
+    {"find", G_CALLBACK(action_find), {"<Primary>f"}, FALSE},
+    {"find-next", G_CALLBACK(action_find_next), {"F3"}, FALSE},
+    {"replace", G_CALLBACK(action_replace), {"<Primary>h"}, FALSE},
+    {"go-to", G_CALLBACK(action_go_to), {"<Primary>g"}, FALSE},
+    {"time-date", G_CALLBACK(action_time_date), {"F5"}, FALSE},
+    {"font", G_CALLBACK(action_font), {NULL}, FALSE},
+    {"zoom-in", G_CALLBACK(action_zoom), {"<Primary>plus", "<Primary>equal", "<Primary>KP_Add"}, FALSE},
+    {"zoom-out", G_CALLBACK(action_zoom), {"<Primary>minus", "<Primary>KP_Subtract"}, FALSE},
+    {"zoom-reset", G_CALLBACK(action_zoom), {"<Primary>0", "<Primary>KP_0"}, FALSE},
+    {"next-tab", G_CALLBACK(action_cycle_tab), {"<Primary>Tab"}, FALSE},
+    {"previous-tab", G_CALLBACK(action_cycle_tab), {"<Primary><Shift>Tab"}, FALSE},
+    {"help", G_CALLBACK(action_help), {"F1"}, FALSE},
+    {"about", G_CALLBACK(action_about), {NULL}, FALSE}
+};
+
+static void append_menu_command(GMenu *menu, const char *label, const char *action) {
+    GMenuItem *item = g_menu_item_new(label, action);
+    for (guint i = 0; i < G_N_ELEMENTS(commands); i++) {
+        if (g_str_has_prefix(action, "app.") && g_str_equal(action + 4, commands[i].name)) {
+            if (commands[i].keys[0])
+                g_menu_item_set_attribute(item, "accel", "s", commands[i].keys[0]);
+            break;
+        }
+    }
+    g_menu_append_item(menu, item);
+    g_object_unref(item);
+}
+
+static GMenu *append_menu_section(GMenu *menu) {
+    GMenu *section = g_menu_new();
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
+    g_object_unref(section);
+    return section; /* Borrowed; the parent menu owns the section. */
+}
+
 static void activate(GtkApplication *app, gpointer data) {
     AppState *state = data;
     if (state->window) { gtk_window_present(GTK_WINDOW(state->window)); return; }
@@ -1857,18 +1915,42 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_window_set_child(GTK_WINDOW(state->window), root);
 
     GMenu *file = g_menu_new();
-    g_menu_append(file, "_New Tab", "app.new"); g_menu_append(file, "_Open...", "app.open");
-    g_menu_append(file, "_Save", "app.save"); g_menu_append(file, "Save _As...", "app.save-as");
-    g_menu_append(file, "Page Set_up...", "app.page-setup"); g_menu_append(file, "_Print...", "app.print"); g_menu_append(file, "Close _Tab", "app.close-tab"); g_menu_append(file, "E_xit", "app.quit");
+    GMenu *section = append_menu_section(file);
+    append_menu_command(section, "_New Tab", "app.new");
+    append_menu_command(section, "_Open…", "app.open");
+    section = append_menu_section(file);
+    append_menu_command(section, "_Save", "app.save");
+    append_menu_command(section, "Save _As…", "app.save-as");
+    section = append_menu_section(file);
+    append_menu_command(section, "Page Set_up…", "app.page-setup");
+    append_menu_command(section, "_Print…", "app.print");
+    section = append_menu_section(file);
+    append_menu_command(section, "_Close Tab", "app.close-tab");
+    append_menu_command(section, "_Quit", "app.quit");
+
     GMenu *edit = g_menu_new();
-    g_menu_append(edit, "_Undo", "app.undo"); g_menu_append(edit, "_Redo", "app.redo");
-    g_menu_append(edit, "Cu_t", "app.cut"); g_menu_append(edit, "_Copy", "app.copy"); g_menu_append(edit, "_Paste", "app.paste");
-    g_menu_append(edit, "De_lete", "app.delete"); g_menu_append(edit, "_Find...", "app.find");
-    g_menu_append(edit, "Find _Next", "app.find-next"); g_menu_append(edit, "R_eplace...", "app.replace");
-    g_menu_append(edit, "_Go To...", "app.go-to"); g_menu_append(edit, "Select _All", "app.select-all"); g_menu_append(edit, "Time/_Date", "app.time-date");
-    GMenu *format = g_menu_new(); g_menu_append(format, "_Word Wrap", "app.wrap"); g_menu_append(format, "_Font...", "app.font");
+    section = append_menu_section(edit);
+    append_menu_command(section, "_Undo", "app.undo");
+    append_menu_command(section, "_Redo", "app.redo");
+    section = append_menu_section(edit);
+    append_menu_command(section, "Cu_t", "app.cut");
+    append_menu_command(section, "_Copy", "app.copy");
+    append_menu_command(section, "_Paste", "app.paste");
+    append_menu_command(section, "_Delete", "app.delete");
+    append_menu_command(section, "Select _All", "app.select-all");
+    section = append_menu_section(edit);
+    append_menu_command(section, "_Find…", "app.find");
+    append_menu_command(section, "Find _Next", "app.find-next");
+    append_menu_command(section, "R_eplace…", "app.replace");
+    append_menu_command(section, "_Go To Line…", "app.go-to");
+    section = append_menu_section(edit);
+    append_menu_command(section, "Insert Date and T_ime", "app.time-date");
+
+    GMenu *format = g_menu_new();
+    append_menu_command(format, "_Word Wrap", "app.wrap");
+    append_menu_command(format, "_Font…", "app.font");
     GMenu *spelling = g_menu_new(), *languages = g_menu_new();
-    g_menu_append(spelling, "Check Spelling", "app.spell-enabled");
+    g_menu_append(spelling, "_Check Spelling", "app.spell-enabled");
     for (guint i = 0; i < state->spell_languages->len; i++) {
         const char *tag = g_ptr_array_index(state->spell_languages, i);
         gchar *label = g_strdup(tag); g_strdelimit(label, "_", '-');
@@ -1877,17 +1959,28 @@ static void activate(GtkApplication *app, gpointer data) {
         g_menu_append_item(languages, item); g_object_unref(item);
     }
     if (!state->spell_languages->len) g_menu_append(languages, "No dictionaries installed", NULL);
-    g_menu_append_submenu(spelling, "Language", G_MENU_MODEL(languages));
-    g_menu_append_submenu(format, "Spelling", G_MENU_MODEL(spelling));
+    g_menu_append_submenu(spelling, "_Language", G_MENU_MODEL(languages));
+    g_menu_append_submenu(format, "_Spelling", G_MENU_MODEL(spelling));
     g_object_unref(spelling); g_object_unref(languages);
-    GMenu *view = g_menu_new(); g_menu_append(view, "_Status Bar", "app.status-bar"); g_menu_append(view, "_Right-to-Left Reading Order", "app.rtl");
-    g_menu_append(view, "_Word Count", "app.word-count");
-    g_menu_append(view, "Show _Invisible Characters", "app.invisible-characters");
+    GMenu *view = g_menu_new();
+    section = append_menu_section(view);
+    append_menu_command(section, "_Status Bar", "app.status-bar");
+    append_menu_command(section, "_Word Count", "app.word-count");
+    append_menu_command(section, "Show _Invisible Characters", "app.invisible-characters");
+    section = append_menu_section(view);
+    append_menu_command(section, "_Right-to-Left Reading Order", "app.rtl");
     GMenu *zoom = g_menu_new();
-    g_menu_append(zoom, "Zoom In", "app.zoom-in"); g_menu_append(zoom, "Zoom Out", "app.zoom-out");
-    g_menu_append(zoom, "Reset Zoom", "app.zoom-reset");
-    g_menu_append_submenu(view, "Zoom", G_MENU_MODEL(zoom)); g_object_unref(zoom);
-    GMenu *help = g_menu_new(); g_menu_append(help, "View _Help", "app.help"); g_menu_append(help, "_About Quillmote", "app.about");
+    append_menu_command(zoom, "Zoom _In", "app.zoom-in");
+    append_menu_command(zoom, "Zoom _Out", "app.zoom-out");
+    append_menu_command(zoom, "_Reset Zoom", "app.zoom-reset");
+    g_menu_append_submenu(section, "_Zoom", G_MENU_MODEL(zoom));
+    g_object_unref(zoom);
+    section = append_menu_section(view);
+    append_menu_command(section, "_Next Tab", "app.next-tab");
+    append_menu_command(section, "_Previous Tab", "app.previous-tab");
+    GMenu *help = g_menu_new();
+    append_menu_command(help, "Quillmote _Help", "app.help");
+    append_menu_command(help, "_About Quillmote", "app.about");
     GMenu *menubar = g_menu_new();
     g_menu_append_submenu(menubar, "_File", G_MENU_MODEL(file)); g_menu_append_submenu(menubar, "_Edit", G_MENU_MODEL(edit));
     g_menu_append_submenu(menubar, "F_ormat", G_MENU_MODEL(format)); g_menu_append_submenu(menubar, "_View", G_MENU_MODEL(view)); g_menu_append_submenu(menubar, "_Help", G_MENU_MODEL(help));
@@ -1921,41 +2014,14 @@ static void activate(GtkApplication *app, gpointer data) {
     g_object_set_data(G_OBJECT(replace), "quillmote-state", state);
     g_signal_connect(replace, "activate", G_CALLBACK(replace_spelling), NULL);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(replace)); g_object_unref(replace);
-    const struct { const char *name; GCallback callback; const char *shortcut; } actions[] = {
-        {"close-tab", G_CALLBACK(action_close_tab), "<Primary>w"},
-        {"next-tab", G_CALLBACK(action_cycle_tab), "<Primary>Tab"},
-        {"previous-tab", G_CALLBACK(action_cycle_tab), "<Primary><Shift>Tab"},
-        {"zoom-in", G_CALLBACK(action_zoom), "<Primary>plus"},
-        {"zoom-out", G_CALLBACK(action_zoom), "<Primary>minus"},
-        {"zoom-reset", G_CALLBACK(action_zoom), "<Primary>0"},
-        {"new", G_CALLBACK(action_new), "<Primary>n"}, {"open", G_CALLBACK(action_open), "<Primary>o"},
-        {"save", G_CALLBACK(action_save), "<Primary>s"}, {"save-as", G_CALLBACK(action_save_as), "<Primary><Shift>s"},
-        {"quit", G_CALLBACK(action_quit), "<Primary>q"}, {"cut", G_CALLBACK(action_cut), NULL},
-        {"copy", G_CALLBACK(action_copy), NULL}, {"paste", G_CALLBACK(action_paste), NULL},
-        {"select-all", G_CALLBACK(action_select_all), NULL}, {"undo", G_CALLBACK(action_undo), NULL},
-        {"redo", G_CALLBACK(action_redo), NULL}, {"delete", G_CALLBACK(action_delete), NULL},
-        {"find", G_CALLBACK(action_find), "<Primary>f"}, {"find-next", G_CALLBACK(action_find_next), "F3"},
-        {"replace", G_CALLBACK(action_replace), "<Primary>h"}, {"go-to", G_CALLBACK(action_go_to), "<Primary>g"},
-        {"time-date", G_CALLBACK(action_time_date), "F5"}, {"font", G_CALLBACK(action_font), NULL},
-        {"page-setup", G_CALLBACK(action_page_setup), NULL}, {"print", G_CALLBACK(action_print), "<Primary>p"},
-        {"help", G_CALLBACK(action_help), "F1"}, {"about", G_CALLBACK(action_about), NULL}
-    };
-    for (guint i = 0; i < G_N_ELEMENTS(actions); i++) {
-        add_action(state, actions[i].name, actions[i].callback);
-        if (actions[i].shortcut) {
-            gchar *name = g_strdup_printf("app.%s", actions[i].name);
-            const char *keys[] = {actions[i].shortcut, NULL};
-            gtk_application_set_accels_for_action(app, name, keys); g_free(name);
+    for (guint i = 0; i < G_N_ELEMENTS(commands); i++) {
+        add_action(state, commands[i].name, commands[i].callback);
+        if (commands[i].keys[0] && !commands[i].widget_binding) {
+            gchar *name = g_strdup_printf("app.%s", commands[i].name);
+            gtk_application_set_accels_for_action(app, name, commands[i].keys);
+            g_free(name);
         }
     }
-    const char *new_keys[] = {"<Primary>n", "<Primary>t", NULL};
-    gtk_application_set_accels_for_action(app, "app.new", new_keys);
-    const char *zoom_in_keys[] = {"<Primary>plus", "<Primary>equal", "<Primary>KP_Add", NULL};
-    const char *zoom_out_keys[] = {"<Primary>minus", "<Primary>KP_Subtract", NULL};
-    const char *zoom_reset_keys[] = {"<Primary>0", "<Primary>KP_0", NULL};
-    gtk_application_set_accels_for_action(app, "app.zoom-in", zoom_in_keys);
-    gtk_application_set_accels_for_action(app, "app.zoom-out", zoom_out_keys);
-    gtk_application_set_accels_for_action(app, "app.zoom-reset", zoom_reset_keys);
     add_toggle(state, "spell-enabled", state->spell_enabled, G_CALLBACK(set_spelling_state));
     GSimpleAction *language = g_simple_action_new_stateful("spell-language", G_VARIANT_TYPE_STRING,
         g_variant_new_string(state->spell_language ? state->spell_language : ""));
