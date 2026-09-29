@@ -13,6 +13,10 @@ Each supplied file opens in a separate tab. If a path does not exist,
 an empty document is opened with that filename; Save creates the file.
 The parent directory must exist. Each launch opens an independent window.
 Use \fB--\fR before filenames beginning with a dash.
+.PP
+Launching without filenames reopens saved files from the most recently closed
+window, preserving tab order, the active tab, cursor positions, and zoom. Missing
+or unavailable files are skipped. Open and Save As remember the last chosen folders.
 .SH OPTIONS
 .TP
 .BR \-v ", " \-\-version
@@ -35,7 +39,10 @@ Install extra dictionaries with the distribution's package manager, then restart
 .SH FILES
 .TP
 .I ~/.config/quillmote/settings.ini
-Editor and window preferences.
+Editor, window, zoom, and file-picker folder preferences.
+.TP
+.I ~/.config/quillmote/session.ini
+Saved tab paths, order, active tab, cursor positions, and zoom; no document contents.
 .TP
 .I ~/.config/quillmote/recovery/
 Private snapshots of unsaved documents. Snapshots do not overwrite original files.

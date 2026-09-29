@@ -4,7 +4,7 @@ Quillmote is a simple, solid text editor. Changes should make everyday editing e
 
 ## Development
 
-Use a C11 compiler, GNU Make, pkg-config, GTK 4.12 or newer, GtkSourceView 5, and GLib development tools. Build with `make`. The application is in `main.c`; file encoding, printing, recovery, and Help/About live in separate modules. Shared application metadata is in `app-info.h`.
+Use a C11 compiler, GNU Make, pkg-config, GTK 4.12 or newer, GtkSourceView 5, and GLib development tools. Build with `make`. The application is in `main.c`; file encoding, printing, recovery, session persistence, and Help/About live in separate modules. Shared application metadata is in `app-info.h`.
 
 Run `make test` in a graphical session and `make test-cli check-desktop` before submitting changes. The GUI tests open temporary windows and use temporary files and preferences; printing checks export PDFs. Explain the change and how you verified it. Include steps to reproduce bugs and the version from `quillmote --version`.
 

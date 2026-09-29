@@ -7,10 +7,12 @@ static const struct { const char *id, *title, *text; } topics[] = {
      "Quillmote keeps everyday writing and editing simple. Open a file, write your text, and save when you are ready.\n\n"
      "Use File → Open (Ctrl+O), drop files onto the window, or pass filenames on the command line. You can select several files at once. Each file opens in its own tab; opening the same path again selects its existing tab.\n\n"
      "Ctrl+S saves the active document. Ctrl+Shift+S opens Save As, where you can change the filename, encoding, and line endings. A star beside the filename means you have unsaved changes.\n\n"
+     "Open remembers the last folder you chose. Save As uses the document's current location, or your last Save As folder for a new document, falling back to the Open folder. Cancelling the picker keeps the previous folder.\n\n"
      "Launching quillmote new-file.txt opens an empty document if that file does not exist. Save creates it; its parent folder must already exist."},
     {"tabs", "Tabs and editing",
      "Ctrl+T or Ctrl+N creates a tab. Ctrl+W closes the current tab. Ctrl+Tab and Ctrl+Shift+Tab move between tabs; these commands are also in the View menu. You can drag tab headers to reorder them, and hover a filename to see its full path.\n\n"
      "Each tab keeps its own undo history, cursor position, search, and view settings. Closing a modified tab asks whether to Save, Don't Save, or Cancel. Closing the last tab leaves a blank document. Ctrl+Q closes the window, checking each tab for unsaved changes.\n\n"
+     "Starting without filenames restores the saved files from the most recently closed window, in tab order, with the active tab, cursor positions, and zoom levels. Missing or unavailable files are skipped. Opening specific filenames starts with those files. Tabs you close individually are left out of the next saved session.\n\n"
      "Ctrl+Z undoes an edit; Ctrl+Shift+Z redoes it. Ctrl+X, Ctrl+C, and Ctrl+V cut, copy, and paste. Ctrl+A selects all text.\n\n"
      "Enter carries the current line's leading spaces and tabs onto the new line. Shift+Enter inserts a plain line break without copying indentation.\n\n"
      "Ctrl+G goes to a document line, including when word wrap is enabled. F5 inserts the current date and time. Files beginning with .LOG on their own first line receive a timestamp when opened."},
@@ -21,7 +23,7 @@ static const struct { const char *id, *title, *text; } topics[] = {
      "Escape closes the search panel and returns focus to the editor."},
     {"view", "Appearance and counts",
      "The editor follows your system's light or dark appearance. Format → Font chooses the text family, style, and size. Word Wrap keeps long lines inside the window without inserting line breaks.\n\n"
-     "Ctrl++ (or Ctrl+=) zooms in, Ctrl+- zooms out, and Ctrl+0 resets to 100%. Zoom affects the screen, not the saved text or printed font size.\n\n"
+     "Ctrl++ (or Ctrl+=) zooms in, Ctrl+- zooms out, and Ctrl+0 resets to 100%. Zoom is remembered between launches and affects the screen, not the saved text or printed font size.\n\n"
      "View → Word Count shows words and characters in the status bar. When text is selected, it counts the selection. Counts include Unicode text and update in small batches for large files.\n\n"
      "View → Show Invisible Characters reveals spaces, tabs, non-breaking spaces, and line endings. It does not change or add characters to the file.\n\n"
      "View also controls the status bar and right-to-left reading order. Font, spelling, and view preferences are remembered for new tabs and future launches."},
@@ -38,8 +40,8 @@ static const struct { const char *id, *title, *text; } topics[] = {
     {"recovery", "Saving and recovery",
      "Save regularly with Ctrl+S. Crash recovery is a backup for interrupted sessions, not an automatic save to your original file.\n\n"
      "Quillmote snapshots unsaved changes about every two seconds. After a crash, starting without filenames restores available snapshots in separate tabs marked Recovered. When opening a specific file, use the Recover banner to bring back previous work alongside it.\n\n"
-     "Saving or explicitly discarding a document clears its snapshot. Recovery never overwrites the original file automatically. The most recent edits can be lost if a crash happens before a snapshot finishes.\n\n"
-     "Preferences are stored in ~/.config/quillmote/settings.ini and recovery files in ~/.config/quillmote/recovery/. If XDG_CONFIG_HOME is set, that directory is used instead. Other running tabs' recovery files are left alone."},
+     "Saving or explicitly discarding a document clears its snapshot. Recovered text takes priority over the disk copy when restoring a saved session. Recovery never overwrites the original file automatically. The most recent edits can be lost if a crash happens before a snapshot finishes.\n\n"
+     "Preferences are stored in ~/.config/quillmote/settings.ini, saved tab paths and positions in ~/.config/quillmote/session.ini, and recovery files in ~/.config/quillmote/recovery/. If XDG_CONFIG_HOME is set, that directory is used instead. Other running tabs' recovery files are left alone."},
     {"printing", "Printing",
      "File → Page Setup chooses paper, orientation, margins, and headers and footers. Ctrl+P opens your desktop's print dialog, including Print to File or PDF when available.\n\n"
      "Printing uses the selected font and black text on white paper. On-screen zoom, spelling marks, search highlights, and invisible-character markers are not printed.\n\n"

@@ -8,3 +8,4 @@ tests/help
 tests/memory
 /build/
 /dist/
+tests/session

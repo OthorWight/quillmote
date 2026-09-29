@@ -6,6 +6,7 @@
 #include "document.h"
 #include "printing.h"
 #include "recovery.h"
+#include "session.h"
 #include "help.h"
 #include "app-info.h"
 #include <glib/gstdio.h>
@@ -51,6 +52,10 @@ typedef struct AppState {
     GtkWidget *notebook, *page, *tab_label;
     gboolean closed, disposed, closing_window;
     PendingAction after_load;
+    Session *closing_session;
+    guint session_slot;
+    gboolean skip_session_restore, session_restore_pending;
+    gchar *last_open_folder, *last_save_folder;
     GtkApplication *app;
     GtkWidget *window;
     GtkSourceView *view;
@@ -125,6 +130,7 @@ static void close_tab(AppState *state);
 static void quit_window(AppState *state);
 static void sync_tab_actions(AppState *state);
 static void dispose_document(AppState *state);
+static void restore_session(AppState *state);
 static void setup_search(AppState *state);
 static void schedule_counts(AppState *state, gboolean changed);
 static void update_search_count(AppState *state);
@@ -258,7 +264,8 @@ static gboolean save_contents(AppState *state, const char *filename, TextEncodin
 struct LoadJob {
     AppState *state;
     gchar *path;
-    int requested_encoding;
+    int requested_encoding, restore_cursor;
+    gboolean from_session;
     gboolean create, recover;
     RecoverySession *claimed;
     RecoveryDocument *document;
@@ -301,18 +308,30 @@ static void loading_controls(AppState *state, gboolean loading) {
 
 static void load_finished(LoadJob *job, GError *error) {
     AppState *state = job->state;
+    gboolean failed_restore = job->from_session && error &&
+        !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
     PendingAction after = state->after_load;
     state->after_load = PENDING_NONE;
     state->loading = NULL;
     g_clear_object(&state->load_cancel);
     loading_controls(state, FALSE);
-    if (error && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    if (error && !job->from_session && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         show_error(state, job->recover ? "Could not recover document" : "Could not open file", error);
     g_clear_error(&error);
     recovery_session_free(job->claimed);
     recovery_document_free(job->document);
     g_clear_object(&job->staging); g_free(job->path); g_free(job);
     if (after != PENDING_NONE) request_document_change(state, after);
+    else if (failed_restore) close_tab(state);
+    AppState *window = window_state(state);
+    if (window->session_restore_pending && !window->closing_window) {
+        gboolean loading = FALSE;
+        for (guint i = 0; i < window->tabs->len; i++) {
+            AppState *tab = g_ptr_array_index(window->tabs, i);
+            loading |= tab->loading != NULL;
+        }
+        if (!loading) restore_session(window);
+    }
     g_application_release(G_APPLICATION(state->app));
 }
 
@@ -355,8 +374,8 @@ static gboolean insert_loaded_chunk(gpointer data) {
         gchar *entry = g_strdup_printf("%s%s\n", g_str_has_suffix(text, "\n") ? "" : "\n", stamp);
         gtk_text_buffer_insert(buffer, &iter, entry, -1);
         g_free(stamp); g_free(entry);
-    } else gtk_text_buffer_get_iter_at_offset(buffer, &iter, job->recover ?
-        CLAMP(job->document->cursor, 0, gtk_text_buffer_get_char_count(buffer)) : 0);
+    } else gtk_text_buffer_get_iter_at_offset(buffer, &iter,
+        CLAMP(job->recover ? job->document->cursor : job->restore_cursor, 0, gtk_text_buffer_get_char_count(buffer)));
     gtk_text_buffer_place_cursor(buffer, &iter);
     schedule_spell_scan(buffer, state);
     gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(state->view), gtk_text_buffer_get_insert(buffer));
@@ -449,8 +468,31 @@ static void cancel_load(GtkButton *button, gpointer data) {
 }
 
 static void cancel_pending(AppState *state) {
-    window_state(state)->closing_window = FALSE;
+    AppState *window = window_state(state);
+    window->closing_window = FALSE;
+    g_clear_pointer(&window->closing_session, session_free);
     state->busy = FALSE; state->pending = PENDING_NONE;
+}
+
+static void remember_file_folder(AppState *state, const char *path, gboolean save) {
+    AppState *window = window_state(state);
+    gchar **folder = save ? &window->last_save_folder : &window->last_open_folder;
+    g_free(*folder); *folder = g_path_get_dirname(path);
+    save_preferences(state);
+}
+
+static gchar *file_picker_folder(AppState *state, gboolean save) {
+    AppState *window = window_state(state);
+    gchar *document_folder = state->filename ? g_path_get_dirname(state->filename) : NULL;
+    const char *folders[] = {save ? document_folder : NULL, save ? window->last_save_folder : NULL,
+                            window->last_open_folder, document_folder};
+    gchar *chosen = NULL;
+    for (guint i = 0; i < G_N_ELEMENTS(folders); i++) {
+        if (folders[i] && g_file_test(folders[i], G_FILE_TEST_IS_DIR)) {
+            chosen = g_strdup(folders[i]); break;
+        }
+    }
+    g_free(document_folder); return chosen;
 }
 
 /* GtkFileChooserNative supports encoding choices in the native file dialog. */
@@ -465,8 +507,10 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
         for (guint i = 0; i < g_list_model_get_n_items(files); i++) {
             GFile *file = g_list_model_get_item(files, i);
             gchar *path = g_file_get_path(file);
-            if (path) open_tab(state, path, FALSE, FALSE);
-            else {
+            if (path) {
+                remember_file_folder(state, path, FALSE);
+                open_tab(state, path, FALSE, FALSE);
+            } else {
                 GError *error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Choose a file on a local or mounted drive.");
                 show_error(state, "Could not access file", error); g_error_free(error);
             }
@@ -477,6 +521,7 @@ static void file_chosen(GtkNativeDialog *dialog, int response, gpointer data) {
         GFile *file = gtk_file_chooser_get_file(chooser);
         gchar *path = file ? g_file_get_path(file) : NULL;
         if (path) {
+            remember_file_folder(state, path, TRUE);
             const char *choice = gtk_file_chooser_get_choice(chooser, "encoding");
             TextEncoding encoding = choice ? g_ascii_strtoll(choice, NULL, 10) : state->encoding;
             const char *line_choice = gtk_file_chooser_get_choice(chooser, "line-ending");
@@ -509,10 +554,18 @@ static void choose_file(AppState *state, gboolean save) {
     gtk_file_filter_add_pattern(all, "*"); gtk_file_chooser_add_filter(chooser, all);
     if (!save) gtk_file_chooser_set_filter(chooser, all);
     g_object_unref(all);
-    if (state->filename) {
+    if (save && state->filename) {
         GFile *file = g_file_new_for_path(state->filename);
         gtk_file_chooser_set_file(chooser, file, NULL); g_object_unref(file);
-    } else if (save) gtk_file_chooser_set_current_name(chooser, "Untitled.txt");
+    } else {
+        gchar *folder = file_picker_folder(state, save);
+        if (folder) {
+            GFile *directory = g_file_new_for_path(folder);
+            gtk_file_chooser_set_current_folder(chooser, directory, NULL); g_object_unref(directory);
+        }
+        g_free(folder);
+        if (save) gtk_file_chooser_set_current_name(chooser, "Untitled.txt");
+    }
     /* Portal backends may show custom choices as a separate preliminary screen.
      * Open needs no choices: detect the encoding after the file is selected. */
     if (save) {
@@ -1396,6 +1449,12 @@ static void load_preferences(AppState *state) {
         if (width >= 320 && width <= 16384) state->window_width = width;
         if (height >= 200 && height <= 16384) state->window_height = height;
         state->maximized = g_key_file_get_boolean(settings, "Window", "maximized", NULL);
+        int zoom = g_key_file_get_integer(settings, "Editor", "zoom", NULL);
+        if (zoom >= 50 && zoom <= 300) state->zoom = zoom;
+        if (!state->owner) {
+            state->last_open_folder = g_key_file_get_string(settings, "Folders", "open", NULL);
+            state->last_save_folder = g_key_file_get_string(settings, "Folders", "save", NULL);
+        }
         GtkPageSetup *page = gtk_page_setup_new_from_key_file(settings, "Page Setup", NULL);
         if (page) { g_set_object(&state->printing.page_setup, page); g_object_unref(page); }
         const char *keys[] = {"header", "footer"};
@@ -1419,6 +1478,10 @@ static void save_preferences(AppState *state) {
     g_key_file_set_boolean(settings, "Editor", "word-count", state->show_word_count);
     g_key_file_set_boolean(settings, "Editor", "invisible-characters", state->show_invisibles);
     if (state->spell_language) g_key_file_set_string(settings, "Editor", "spell-language", state->spell_language);
+    g_key_file_set_integer(settings, "Editor", "zoom", state->zoom);
+    AppState *window = window_state(state);
+    if (window->last_open_folder) g_key_file_set_string(settings, "Folders", "open", window->last_open_folder);
+    if (window->last_save_folder) g_key_file_set_string(settings, "Folders", "save", window->last_save_folder);
     g_key_file_set_integer(settings, "Window", "width", window_state(state)->window_width);
     g_key_file_set_integer(settings, "Window", "height", window_state(state)->window_height);
     g_key_file_set_boolean(settings, "Window", "maximized", window_state(state)->maximized);
@@ -1553,13 +1616,22 @@ static gboolean startup_recovery(gpointer data) {
     AppState *state = data;
     state->recovery_start_idle = 0;
     recovery_refresh(state);
-    if (!state->busy && !state->filename && !gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer)) &&
+    if (!state->skip_session_restore && !state->busy && !state->filename && !gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer)) &&
         gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer)) == 0) {
         gchar *path;
         while ((path = recovery_find(state->recovery_directory))) {
             AppState *tab = open_tab(state, path, FALSE, TRUE); g_free(path);
             if (!tab || !tab->loading) break;
         }
+    }
+    if (!state->skip_session_restore) {
+        state->session_restore_pending = TRUE;
+        gboolean loading = FALSE;
+        for (guint i = 0; i < state->tabs->len; i++) {
+            AppState *tab = g_ptr_array_index(state->tabs, i);
+            loading |= tab->loading != NULL;
+        }
+        if (!loading) restore_session(state);
     }
     return G_SOURCE_REMOVE;
 }
@@ -1708,8 +1780,26 @@ static void quit_window(AppState *state) {
         AppState *tab = g_ptr_array_index(window->tabs, i);
         if (!tab->closed && tab->busy && !tab->loading) return;
     }
+    if (!window->closing_window) {
+        window->closing_session = session_new();
+        int count = gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook));
+        for (int i = 0; i < count; i++) {
+            GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), i);
+            AppState *tab = g_object_get_data(G_OBJECT(page), "document");
+            SessionTab *saved = g_new0(SessionTab, 1);
+            g_ptr_array_add(window->closing_session->tabs, saved);
+            tab->session_slot = i;
+            if (tab == window->active) window->closing_session->active = i;
+        }
+    }
     window->closing_window = TRUE;
+    window->session_restore_pending = FALSE;
     if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)) == 0) {
+        GError *error = NULL;
+        if (!session_save(window->closing_session, &error)) {
+            g_printerr("Could not remember open tabs: %s\n", error->message); g_clear_error(&error);
+        }
+        g_clear_pointer(&window->closing_session, session_free);
         window->active = NULL;
         gtk_window_destroy(GTK_WINDOW(window->window)); return;
     }
@@ -1719,6 +1809,14 @@ static void quit_window(AppState *state) {
 
 static void close_tab(AppState *state) {
     AppState *window = window_state(state);
+    if (window->closing_session) {
+        SessionTab *saved = g_ptr_array_index(window->closing_session->tabs, state->session_slot);
+        saved->path = g_strdup(state->filename);
+        GtkTextIter cursor;
+        gtk_text_buffer_get_iter_at_mark(GTK_TEXT_BUFFER(state->buffer), &cursor,
+                                        gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(state->buffer)));
+        saved->cursor = gtk_text_iter_get_offset(&cursor); saved->zoom = state->zoom;
+    }
     save_preferences(state); recovery_clear(state);
     state->closed = TRUE;
     int index = gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), state->page);
@@ -1863,6 +1961,35 @@ static AppState *open_tab(AppState *state, const char *path, gboolean create, gb
     else load_file_full(tab, canonical, -1, create, recover);
     g_free(canonical);
     return tab;
+}
+
+static void restore_session(AppState *state) {
+    AppState *window = window_state(state);
+    window->session_restore_pending = FALSE;
+    Session *session = session_load();
+    AppState *selected = NULL;
+    int position = 0;
+    for (guint i = 0; i < session->tabs->len; i++) {
+        SessionTab *saved = g_ptr_array_index(session->tabs, i);
+        /* Let the asynchronous loader check availability, including mounted
+         * drives; a slow filesystem must not block startup on the UI thread. */
+        if (!saved->path) continue;
+        AppState *tab = open_tab(window, saved->path, FALSE, FALSE);
+        if (!tab) continue;
+        gtk_notebook_reorder_child(GTK_NOTEBOOK(window->notebook), tab->page, position++);
+        /* A recovered document owns the newer text and cursor position. */
+        if (tab->loading && !tab->loading->recover) {
+            tab->loading->restore_cursor = saved->cursor;
+            tab->loading->from_session = TRUE;
+            tab->zoom = saved->zoom;
+        } else if (tab->recovered) {
+            tab->zoom = saved->zoom;
+            apply_editor_style(tab);
+        }
+        if ((int)i == session->active) selected = tab;
+    }
+    if (selected) select_tab(selected);
+    session_free(session);
 }
 
 /* The first shortcut is the menu hint. Editing shortcuts belong to the focused
@@ -2076,6 +2203,7 @@ static void activate(GtkApplication *app, gpointer data) {
 static void open_files(GApplication *application, GFile **files, gint count, const gchar *hint, gpointer data) {
     (void)hint;
     AppState *state = data;
+    if (!state->window) state->skip_session_restore = TRUE;
     activate(GTK_APPLICATION(application), state);
     for (int i = 0; i < count; i++) {
         gchar *path = g_file_get_path(files[i]);
@@ -2131,6 +2259,9 @@ static void shutdown_app(GApplication *application, gpointer data) {
         if (tab != state) g_free(tab);
     }
     g_clear_pointer(&state->tabs, g_ptr_array_unref);
+    g_clear_pointer(&state->closing_session, session_free);
+    g_clear_pointer(&state->last_open_folder, g_free);
+    g_clear_pointer(&state->last_save_folder, g_free);
 }
 
 static gint handle_local_options(GApplication *application, GVariantDict *options, gpointer data) {

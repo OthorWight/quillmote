@@ -178,6 +178,7 @@ static void check_tabs(AppState *root, const char *directory) {
     show_find(last, FALSE); gtk_editable_set_text(GTK_EDITABLE(last->find_entry), "file");
     g_action_group_change_action_state(G_ACTION_GROUP(root->app), "invisible-characters", g_variant_new_boolean(TRUE));
     settle(root); flush_events();
+    for (int i = 0; i < 20 && pango_layout_is_ellipsized(gtk_label_get_layout(GTK_LABEL(last->tab_label))); i++) flush_events();
     g_assert_false(pango_layout_is_ellipsized(gtk_label_get_layout(GTK_LABEL(last->tab_label))));
     capture_window(GTK_WINDOW(root->window), directory, "tabs-search-counts.png");
     GValue drop = G_VALUE_INIT; g_value_init(&drop, GDK_TYPE_FILE_LIST);

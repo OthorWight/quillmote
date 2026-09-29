@@ -50,6 +50,8 @@ Press **F1** for an offline guide organized by topic. **Help → About Quillmote
 - Menus show shortcut hints beside commands and group related actions with separators. Standard GTK text-editing shortcuts work, including `Ctrl+Z`, `Ctrl+Shift+Z`, `Ctrl+X/C/V`, `Ctrl+A`, and keyboard navigation. Go To uses document line numbers and remains available with word wrap enabled.
 - Enter copies the current line's leading spaces and tabs onto the new line, preserving mixed indentation. Shift+Enter inserts a line break without indentation.
 - New and Open create tabs without interrupting edits in existing documents. Closing a modified tab offers Save / Don't Save / Cancel; Quit checks each tab in turn. Cancelling Save As retains the original filename. Failed saves preserve the document and stop closing. Closing the last tab leaves a blank document. Each tab keeps its own text, undo history, cursor, search, encoding, and view settings. `Ctrl+Tab` / `Ctrl+Shift+Tab` switch tabs; drag tab headers to reorder them.
+- Starting without filenames reopens the files from the most recently closed window, preserving tab order, the active tab, cursor positions, and each tab's zoom. Files that were deleted or are unavailable are skipped. Opening filenames explicitly starts with those files. Closing a tab removes it from the next saved session; unsaved documents still use Save / Don't Save / Cancel when quitting.
+- Open starts in the last folder you chose. Save As uses the current document's location, or the remembered Save As folder for new documents (falling back to the Open folder). Cancelling a file picker leaves these choices unchanged.
 - Select several files in Open, drop files onto the window, or pass several command-line paths to open tabs. Opening an already-open path selects its existing tab and keeps unsaved edits.
 - File reading and decoding run in a worker thread, and the new text buffer is filled in chunks. A loading bar offers Cancel; cancellation or failure keeps the previous document. Spelling also runs in short batches to keep the UI responsive.
 - Open goes straight to the file picker with **All files** selected and detects the encoding automatically: BOMs and valid UTF-8 are recognized, with Windows-1252 as the fallback. Save As offers UTF-8, UTF-8 with BOM, Unicode (UTF-16 little endian), Unicode big endian, and ANSI (Windows-1252). ANSI characters that cannot be represented produce an error instead of being discarded.
@@ -58,8 +60,8 @@ Press **F1** for an offline guide organized by topic. **Help → About Quillmote
 - A file with `.LOG` on its first line gets the current time/date appended when opened. F5 inserts a timestamp at the cursor, replacing any selection.
 - Escape dismisses open menus and returns focus to the editor. On GTK 4.14 and newer, submenus navigate within one popup to avoid nested popup grabs.
 - Right-click an underlined word for spelling suggestions beside the normal editing commands. Shift+F10 or the Menu key opens suggestions at the cursor. Corrections support Undo. The same context menu offers Add to Dictionary and Ignore Word; ignored words last for the current dictionary session. Format → Spelling lets you turn checking off or choose an installed language. Additional languages require installing a dictionary supported by Enchant through your system’s package manager.
-- `Ctrl++` (or `Ctrl+=`) zooms in, `Ctrl+-` zooms out, and `Ctrl+0` resets to 100%. Zoom ranges from 50–300% and changes only the on-screen text, leaving the chosen font and printing size unchanged. It resets to 100% on launch.
-- Font, word wrap, word counts, invisible characters, status-bar visibility, spelling language/on-off, window size/maximized state, and page setup are saved in `$XDG_CONFIG_HOME/quillmote/settings.ini` (normally `~/.config/quillmote/settings.ini`).
+- `Ctrl++` (or `Ctrl+=`) zooms in, `Ctrl+-` zooms out, and `Ctrl+0` resets to 100%. Zoom ranges from 50–300% and changes only the on-screen text, leaving the chosen font and printing size unchanged. The zoom level is remembered between launches.
+- Font, zoom, last Open/Save As folders, word wrap, word counts, invisible characters, status-bar visibility, spelling language/on-off, window size/maximized state, and page setup are saved in `$XDG_CONFIG_HOME/quillmote/settings.ini` (normally `~/.config/quillmote/settings.ini`).
 
 ## Crash recovery
 
@@ -68,6 +70,8 @@ Modified documents are checked for recovery snapshots every two seconds. Snapsho
 Starting Quillmote without a file automatically restores available snapshots in separate modified tabs marked **Recovered**. When you open a specific file, a small Recover banner offers previous work without interrupting the requested open. The banner opens snapshots in additional tabs, keeping the requested file open. Saving or explicitly discarding a document clears its snapshot. Recovery never writes over the original file automatically.
 
 The most recent edits may be lost if a crash happens before a snapshot finishes. Capturing a large document restarts if it changes during capture; recovery is not a substitute for saving.
+
+Saved session paths and positions are stored in `$XDG_CONFIG_HOME/quillmote/session.ini`; document contents are kept only in the separate crash-recovery snapshots. A successful quit replaces the saved session; cancelling quit keeps the previous one.
 
 ## Printing
 
@@ -82,7 +86,7 @@ make test
 make test-cli check-desktop
 ```
 
-Run the full suite in a graphical session. Tests cover encoding round trips and conversion failures, system appearance and font preservation, contextual spelling, native menu activation and Escape focus recovery, find/replace and undo, navigation, save/discard/cancel workflows, preference persistence, multipage PDF generation, multi-file drag-and-drop and command-line tabs, tab close/save/cancel, Unicode counts, invisible characters, search counts and highlighting, nonexistent command-line paths, zoom, dictionary controls, responsive/cancelled loading, and multi-tab recovery after a forced process termination. They briefly open test windows and dialogs; documents, preferences, screenshots, and PDFs go into temporary directories. No document is sent to a physical printer.
+Run the full suite in a graphical session. Tests cover encoding round trips and conversion failures, system appearance and font preservation, contextual spelling, native menu activation and Escape focus recovery, find/replace and undo, navigation, save/discard/cancel workflows, preference persistence, multipage PDF generation, multi-file drag-and-drop and command-line tabs, tab close/save/cancel, Unicode counts, invisible characters, search counts and highlighting, nonexistent command-line paths, zoom, dictionary controls, responsive/cancelled loading, multi-tab recovery after a forced process termination, and session restoration with missing files, cancelled quit, and recovery precedence. They briefly open test windows and dialogs; documents, preferences, screenshots, and PDFs go into temporary directories. No document is sent to a physical printer.
 
 For the file-format tests without a graphical session:
 
