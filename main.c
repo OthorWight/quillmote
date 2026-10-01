@@ -85,7 +85,7 @@ typedef struct AppState {
     GtkCssProvider *css;
     PangoFontDescription *font;
     gboolean dark_mode;
-    int window_width, window_height, zoom;
+    int window_width, window_height, zoom, tab_width;
     gboolean maximized, spell_enabled;
     gchar *spell_language;
     GPtrArray *spell_languages;
@@ -1250,6 +1250,52 @@ static void action_font(GSimpleAction *action, GVariant *parameter) {
     g_object_unref(dialog);
 }
 
+static void tab_length_accept(GtkButton *button, gpointer data) {
+    (void)button;
+    GtkWindow *dialog = data;
+    AppState *window = g_object_get_data(G_OBJECT(dialog), "state");
+    GtkSpinButton *spin = g_object_get_data(G_OBJECT(dialog), "tab-length");
+    gtk_spin_button_update(spin);
+    int width = gtk_spin_button_get_value_as_int(spin);
+    for (guint i = 0; i < window->tabs->len; i++) {
+        AppState *tab = g_ptr_array_index(window->tabs, i);
+        if (tab->closed || tab->disposed) continue;
+        tab->tab_width = width;
+        gtk_source_view_set_tab_width(tab->view, width);
+    }
+    if (window->active && !window->active->disposed) save_preferences(window->active);
+    gtk_window_destroy(dialog);
+}
+
+static void action_tab_length(GSimpleAction *action, GVariant *parameter) {
+    (void)parameter;
+    AppState *state = action_state(action);
+    GtkWidget *dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dialog), "Tab Length");
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(state->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(box, 16); gtk_widget_set_margin_bottom(box, 16);
+    gtk_widget_set_margin_start(box, 16); gtk_widget_set_margin_end(box, 16);
+    gtk_window_set_child(GTK_WINDOW(dialog), box);
+    GtkWidget *label = gtk_label_new("Tab length (spaces):");
+    GtkWidget *spin = gtk_spin_button_new_with_range(1, 32, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), state->tab_width);
+    gtk_box_append(GTK_BOX(box), label); gtk_box_append(GTK_BOX(box), spin);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel"), *save = gtk_button_new_with_label("Save");
+    gtk_box_append(GTK_BOX(buttons), cancel); gtk_box_append(GTK_BOX(buttons), save);
+    gtk_box_append(GTK_BOX(box), buttons);
+    g_object_set_data(G_OBJECT(dialog), "state", window_state(state));
+    g_object_set_data(G_OBJECT(dialog), "tab-length", spin);
+    g_signal_connect(save, "clicked", G_CALLBACK(tab_length_accept), dialog);
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), dialog);
+    gtk_window_set_default_widget(GTK_WINDOW(dialog), save);
+    gtk_widget_set_receives_default(spin, TRUE);
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+
 static void dictionary_found(const char *tag, const char *provider, const char *description,
                              const char *file, void *data) {
     (void)provider; (void)description; (void)file;
@@ -1426,10 +1472,13 @@ static void load_preferences(AppState *state) {
     state->font = pango_font_description_from_string("Monospace 12");
     state->word_wrap = TRUE; state->show_status = TRUE; state->spell_enabled = TRUE; state->show_word_count = TRUE;
     state->window_width = 920; state->window_height = 620; state->zoom = 100;
+    state->tab_width = 4;
     print_options_init(&state->printing);
     GKeyFile *settings = g_key_file_new();
     gchar *path = preferences_path();
     if (g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, NULL)) {
+        int tab_width = g_key_file_get_integer(settings, "Editor", "tab-width", NULL);
+        if (tab_width >= 1 && tab_width <= 32) state->tab_width = tab_width;
         gchar *font = g_key_file_get_string(settings, "Editor", "font", NULL);
         if (font) {
             PangoFontDescription *description = pango_font_description_from_string(font);
@@ -1479,6 +1528,7 @@ static void save_preferences(AppState *state) {
     g_key_file_set_boolean(settings, "Editor", "invisible-characters", state->show_invisibles);
     if (state->spell_language) g_key_file_set_string(settings, "Editor", "spell-language", state->spell_language);
     g_key_file_set_integer(settings, "Editor", "zoom", state->zoom);
+    g_key_file_set_integer(settings, "Editor", "tab-width", state->tab_width);
     AppState *window = window_state(state);
     if (window->last_open_folder) g_key_file_set_string(settings, "Folders", "open", window->last_open_folder);
     if (window->last_save_folder) g_key_file_set_string(settings, "Folders", "save", window->last_save_folder);
@@ -1868,7 +1918,7 @@ static void create_editor(AppState *state) {
     gtk_widget_set_name(GTK_WIDGET(state->view), editor_name); g_free(editor_name);
     gtk_source_view_set_show_line_numbers(state->view, FALSE);
     gtk_source_view_set_highlight_current_line(state->view, TRUE);
-    gtk_source_view_set_tab_width(state->view, 8);
+    gtk_source_view_set_tab_width(state->view, state->tab_width);
     gtk_source_view_set_auto_indent(state->view, TRUE);
     gtk_source_buffer_set_implicit_trailing_newline(state->buffer, FALSE);
     GtkSourceSpaceDrawer *drawer = gtk_source_view_get_space_drawer(state->view);
@@ -2021,6 +2071,7 @@ static const struct {
     {"go-to", G_CALLBACK(action_go_to), {"<Primary>g"}, FALSE},
     {"time-date", G_CALLBACK(action_time_date), {"F5"}, FALSE},
     {"font", G_CALLBACK(action_font), {NULL}, FALSE},
+    {"tab-length", G_CALLBACK(action_tab_length), {NULL}, FALSE},
     {"zoom-in", G_CALLBACK(action_zoom), {"<Primary>plus", "<Primary>equal", "<Primary>KP_Add"}, FALSE},
     {"zoom-out", G_CALLBACK(action_zoom), {"<Primary>minus", "<Primary>KP_Subtract"}, FALSE},
     {"zoom-reset", G_CALLBACK(action_zoom), {"<Primary>0", "<Primary>KP_0"}, FALSE},
@@ -2104,6 +2155,7 @@ static void activate(GtkApplication *app, gpointer data) {
     GMenu *format = g_menu_new();
     append_menu_command(format, "_Word Wrap", "app.wrap");
     append_menu_command(format, "_Font…", "app.font");
+    append_menu_command(format, "_Tab Length…", "app.tab-length");
     GMenu *spelling = g_menu_new(), *languages = g_menu_new();
     g_menu_append(spelling, "_Check Spelling", "app.spell-enabled");
     for (guint i = 0; i < state->spell_languages->len; i++) {
