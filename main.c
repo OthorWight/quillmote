@@ -2266,7 +2266,8 @@ static void activate(GtkApplication *app, gpointer data) {
     g_signal_connect(state->window, "notify::default-width", G_CALLBACK(remember_window), state);
     g_signal_connect(state->window, "notify::default-height", G_CALLBACK(remember_window), state);
     g_signal_connect(state->window, "notify::maximized", G_CALLBACK(remember_window), state);
-    gtk_window_set_titlebar(GTK_WINDOW(state->window), gtk_header_bar_new());
+    GtkWidget *header = gtk_header_bar_new();
+    gtk_window_set_titlebar(GTK_WINDOW(state->window), header);
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_window_set_child(GTK_WINDOW(state->window), root);
 
@@ -2333,7 +2334,7 @@ static void activate(GtkApplication *app, gpointer data) {
     g_menu_append_submenu(menubar, "F_ormat", G_MENU_MODEL(format)); g_menu_append_submenu(menubar, "_View", G_MENU_MODEL(view)); g_menu_append_submenu(menubar, "_Help", G_MENU_MODEL(help));
     GtkWidget *menu_bar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(menubar));
     configure_menu_popovers(menu_bar);
-    gtk_box_append(GTK_BOX(root), menu_bar);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), menu_bar);
     GtkEventController *escape = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(escape, GTK_PHASE_CAPTURE);
     g_signal_connect(escape, "key-pressed", G_CALLBACK(menu_escape), state);

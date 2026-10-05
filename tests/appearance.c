@@ -205,8 +205,18 @@ static void capture_menu(GtkWidget *button, const char *directory, const char *n
     g_free(path); g_object_unref(texture); gsk_render_node_unref(node); g_object_unref(paintable);
 }
 
+static GtkWidget *find_menu_bar(GtkWidget *widget) {
+    if (GTK_IS_POPOVER_MENU_BAR(widget)) return widget;
+    for (GtkWidget *child = gtk_widget_get_first_child(widget); child; child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *found = find_menu_bar(child);
+        if (found) return found;
+    }
+    return NULL;
+}
+
 static void check_visible_shortcuts(AppState *state, const char *directory) {
-    GtkWidget *bar = gtk_widget_get_first_child(gtk_window_get_child(GTK_WINDOW(state->window)));
+    GtkWidget *bar = find_menu_bar(gtk_window_get_titlebar(GTK_WINDOW(state->window)));
+    g_assert_nonnull(bar);
     GMenuModel *model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(bar));
     guint hints = 0;
     check_menu_shortcuts(model, state->app, &hints);
@@ -286,7 +296,8 @@ static void check_menu_lifecycle(AppState *state) {
         g_assert_false(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state));
     }
 
-    GtkWidget *bar = gtk_widget_get_first_child(gtk_window_get_child(GTK_WINDOW(state->window)));
+    GtkWidget *bar = find_menu_bar(gtk_window_get_titlebar(GTK_WINDOW(state->window)));
+    g_assert_nonnull(bar);
     GtkWidget *format = gtk_widget_get_first_child(bar);
     format = gtk_widget_get_next_sibling(gtk_widget_get_next_sibling(format));
     g_assert_true(gtk_widget_activate(format)); flush_events();
@@ -326,7 +337,9 @@ int main(void) {
 
     GtkWidget *root = gtk_window_get_child(GTK_WINDOW(state.window));
     g_assert_true(GTK_IS_HEADER_BAR(gtk_window_get_titlebar(GTK_WINDOW(state.window))));
-    GtkWidget *menubar = gtk_widget_get_first_child(root);
+    g_assert_true(gtk_widget_get_first_child(root) == state.notebook);
+    GtkWidget *menubar = find_menu_bar(gtk_window_get_titlebar(GTK_WINDOW(state.window)));
+    g_assert_nonnull(menubar);
     GMenuModel *menu = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menubar));
     GMenuModel *format = g_menu_model_get_item_link(menu, 2, G_MENU_LINK_SUBMENU);
     gchar *font_action = NULL;
