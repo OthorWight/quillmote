@@ -60,7 +60,8 @@ typedef struct AppState {
     GtkWidget *window;
     GtkSourceView *view;
     GtkSourceBuffer *buffer;
-    GtkWidget *status;
+    GtkWidget *status, *status_position, *status_counts, *status_format, *status_recovery;
+    GtkWidget *status_wrap, *status_spelling, *status_zoom, *zoom_value, *zoom_out, *zoom_in;
     GtkSourceSearchContext *search_context;
     GtkWidget *search_count;
     gboolean show_word_count, show_invisibles;
@@ -135,6 +136,7 @@ static void setup_search(AppState *state);
 static void schedule_counts(AppState *state, gboolean changed);
 static void update_search_count(AppState *state);
 static void queue_search_count(AppState *state);
+static void status_zoom_changed(GtkSpinButton *spin, gpointer data);
 
 static void apply_editor_style(AppState *state) {
     const PangoFontDescription *font = state->font;
@@ -151,7 +153,9 @@ static void apply_editor_style(AppState *state) {
     PangoStyle style = pango_font_description_get_style(font);
     char *css = g_strdup_printf(
         "#editor-%p { font-family: '%s'; font-size: %s%s; font-weight: %d; font-style: %s; } "
-        ".quillmote-status { padding: 4px 8px; background: %s; color: %s; } "
+        ".quillmote-status { padding: 3px 8px; background: %s; color: %s; } "
+        ".quillmote-status button { padding: 3px 6px; min-height: 22px; min-width: 0; } "
+        ".quillmote-status separator { margin: 3px 4px; } "
         ".find-bar { padding: 5px; background: %s; }",
         (void *)state, escaped_family->str, size, pango_font_description_get_size_is_absolute(font) ? "px" : "pt",
         pango_font_description_get_weight(font),
@@ -185,24 +189,53 @@ static void update_status(AppState *state) {
     GtkTextIter iter;
     GtkTextMark *mark = gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(state->buffer));
     gtk_text_buffer_get_iter_at_mark(GTK_TEXT_BUFFER(state->buffer), &iter, mark);
-    GString *message = g_string_new(NULL);
-    g_string_append_printf(message, "Ln %d, Col %d", gtk_text_iter_get_line(&iter) + 1, gtk_text_iter_get_line_offset(&iter) + 1);
+    gchar *position = g_strdup_printf("Ln %d, Col %d", gtk_text_iter_get_line(&iter) + 1, gtk_text_iter_get_line_offset(&iter) + 1);
+    gtk_button_set_label(GTK_BUTTON(state->status_position), position);
+    gchar *position_tip = g_strdup_printf("%s — Go to line (Ctrl+G)", position);
+    gtk_widget_set_tooltip_text(state->status_position, position_tip);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(state->status_position), GTK_ACCESSIBLE_PROPERTY_LABEL, position_tip, -1);
+    g_free(position_tip); g_free(position);
+
+    gtk_widget_set_visible(state->status_counts, state->show_word_count);
     if (state->show_word_count) {
         gboolean selected = state->selection_end > state->selection_start;
         CountScan *count = selected ? &state->selection_count : &state->document_count;
         int characters = selected ? state->selection_end - state->selection_start : gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer));
         gchar *words = count->pending ? g_strdup("Counting…") : g_strdup_printf("%u word%s", count->words, count->words == 1 ? "" : "s");
-        g_string_append_printf(message, "     %s%s · %d character%s", selected ? "Selection: " : "", words, characters, characters == 1 ? "" : "s");
-        g_free(words);
+        gchar *counts = g_strdup_printf("%s%s · %d character%s", selected ? "Selection: " : "", words, characters, characters == 1 ? "" : "s");
+        gtk_label_set_text(GTK_LABEL(state->status_counts), counts);
+        gtk_widget_set_tooltip_text(state->status_counts, counts);
+        g_free(counts); g_free(words);
     }
-    g_string_append_printf(message, "     %s     %s     Zoom %d%%     Spell check: %s%s",
-        encoding_label(state->encoding), state->encoding == ENCODING_BYTES ? "Byte-preserving view" : state->ending == ENDING_CRLF ? "Windows (CRLF)" : state->ending == ENDING_CR ? "Mac (CR)" : "Unix (LF)",
-        state->zoom, state->encoding == ENCODING_BYTES ? "off for raw bytes" : !state->spell_enabled ? "off" :
-        state->dictionary ? state->spell_language : "unavailable",
-        state->recovery_failed ? "     Recovery unavailable" : "");
-    gtk_label_set_text(GTK_LABEL(state->status), message->str);
-    gtk_widget_set_tooltip_text(state->status, message->str);
-    g_string_free(message, TRUE);
+
+    const char *encodings[] = {"UTF-8", "UTF-8 BOM", "UTF-16 LE", "UTF-16 BE", "ANSI", "Raw bytes"};
+    const char *endings[] = {"LF", "CRLF", "CR"};
+    gchar *format = state->encoding == ENCODING_BYTES ? g_strdup("Raw bytes") :
+        g_strdup_printf("%s · %s", encodings[state->encoding], endings[state->ending]);
+    gtk_label_set_text(GTK_LABEL(state->status_format), format); g_free(format);
+    gchar *format_tip = g_strdup_printf("%s · %s\nChange encoding or line endings with File → Save As.",
+        encoding_label(state->encoding), state->encoding == ENCODING_BYTES ? "Byte-preserving view" :
+        state->ending == ENDING_CRLF ? "Windows (CRLF)" : state->ending == ENDING_CR ? "Mac (CR)" : "Unix (LF)");
+    gtk_widget_set_tooltip_text(state->status_format, format_tip); g_free(format_tip);
+    gtk_widget_set_visible(state->status_recovery, state->recovery_failed);
+    gtk_widget_set_tooltip_text(state->status_wrap, state->word_wrap ? "Word wrap is on" : "Word wrap is off");
+    const char *spelling = state->encoding == ENCODING_BYTES ? "off for raw bytes" : !state->spell_enabled ? "off" :
+        state->dictionary ? state->spell_language : "unavailable";
+    gchar *spell_tip = g_strdup_printf("Spell check: %s\nChange spelling settings and language.", spelling);
+    gtk_widget_set_tooltip_text(state->status_spelling, spell_tip); g_free(spell_tip);
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->status_spelling),
+        state->encoding == ENCODING_BYTES || !state->spell_enabled ? "Spell: Off" : state->dictionary ? "Spelling" : "Spell: N/A");
+
+    gchar *zoom = g_strdup_printf("%d%%", state->zoom);
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->status_zoom), zoom);
+    gchar *zoom_tip = g_strdup_printf("Zoom %s — Change zoom (50–300%%)", zoom);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(state->status_zoom), GTK_ACCESSIBLE_PROPERTY_LABEL, zoom_tip, -1);
+    g_free(zoom_tip); g_free(zoom);
+    g_signal_handlers_block_by_func(state->zoom_value, status_zoom_changed, state);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(state->zoom_value), state->zoom);
+    g_signal_handlers_unblock_by_func(state->zoom_value, status_zoom_changed, state);
+    gtk_widget_set_sensitive(state->zoom_out, state->zoom > 50);
+    gtk_widget_set_sensitive(state->zoom_in, state->zoom < 300);
 }
 
 static void show_error(AppState *state, const char *title, GError *error) {
@@ -295,6 +328,7 @@ static void loading_controls(AppState *state, gboolean loading) {
     gtk_widget_set_visible(state->loading_bar, loading);
     gtk_widget_set_sensitive(GTK_WIDGET(state->view), !loading);
     gtk_widget_set_sensitive(state->find_bar, !loading);
+    gtk_widget_set_sensitive(state->status, !loading);
     if (active_state(state) != state) return;
     gchar **names = g_action_group_list_actions(G_ACTION_GROUP(state->app));
     for (int i = 0; names[i]; i++) {
@@ -679,7 +713,7 @@ static void configure_menu_popovers(GtkWidget *widget) {
 static void collect_open_menus(GtkWidget *widget, GPtrArray *menus) {
     for (GtkWidget *child = gtk_widget_get_first_child(widget); child; child = gtk_widget_get_next_sibling(child))
         collect_open_menus(child, menus);
-    if (GTK_IS_POPOVER_MENU(widget) && gtk_widget_get_visible(widget))
+    if (GTK_IS_POPOVER(widget) && gtk_widget_get_visible(widget))
         g_ptr_array_add(menus, g_object_ref(widget));
 }
 
@@ -704,7 +738,7 @@ static gboolean menu_escape(GtkEventControllerKey *controller, guint keyval, gui
     AppState *state = active_state(data);
     if (keyval != GDK_KEY_Escape) return FALSE;
     GtkWidget *focus = gtk_root_get_focus(GTK_ROOT(state->window));
-    gboolean menu_focus = focus && (gtk_widget_get_ancestor(focus, GTK_TYPE_POPOVER_MENU) ||
+    gboolean menu_focus = focus && (gtk_widget_get_ancestor(focus, GTK_TYPE_POPOVER) ||
                                     gtk_widget_get_ancestor(focus, GTK_TYPE_POPOVER_MENU_BAR));
     if (!dismiss_editor_menus(state) && !menu_focus) return FALSE;
     gtk_widget_grab_focus(GTK_WIDGET(state->view));
@@ -1079,6 +1113,7 @@ static void set_wrap_state(GSimpleAction *action, GVariant *value, gpointer data
     AppState *state = active_state(data);
     state->word_wrap = g_variant_get_boolean(value);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(state->view), state->word_wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
+    update_status(state);
     g_simple_action_set_state(action, value);
 }
 
@@ -1441,13 +1476,21 @@ static void spelling_word_action(GSimpleAction *action, GVariant *value) {
     schedule_spell_scan(NULL, state);
 }
 
+static void set_zoom(AppState *state, int zoom) {
+    state->zoom = CLAMP(zoom, 50, 300);
+    apply_editor_style(state); update_status(state);
+}
+
+static void status_zoom_changed(GtkSpinButton *spin, gpointer data) {
+    set_zoom(data, gtk_spin_button_get_value_as_int(spin));
+}
+
 static void action_zoom(GSimpleAction *action, GVariant *parameter) {
     (void)parameter;
     AppState *state = action_state(action);
     const char *name = g_action_get_name(G_ACTION(action));
-    state->zoom = g_str_equal(name, "zoom-reset") ? 100 :
-        CLAMP(state->zoom + (g_str_equal(name, "zoom-in") ? 10 : -10), 50, 300);
-    apply_editor_style(state); update_status(state);
+    set_zoom(state, g_str_equal(name, "zoom-reset") ? 100 :
+        state->zoom + (g_str_equal(name, "zoom-in") ? 10 : -10));
 }
 
 static void cursor_moved(GtkTextBuffer *buffer, GtkTextIter *location, GtkTextMark *mark, gpointer data) {
@@ -1891,6 +1934,115 @@ static void action_cycle_tab(GSimpleAction *action, GVariant *parameter) {
     if (count) gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook), (current + step + count) % count);
 }
 
+static GMenu *build_spelling_menu(AppState *state) {
+    GMenu *spelling = g_menu_new(), *languages = g_menu_new();
+    g_menu_append(spelling, "_Check Spelling", "app.spell-enabled");
+    for (guint i = 0; i < state->spell_languages->len; i++) {
+        const char *tag = g_ptr_array_index(state->spell_languages, i);
+        gchar *label = g_strdup(tag); g_strdelimit(label, "_", '-');
+        GMenuItem *item = g_menu_item_new(label, NULL); g_free(label);
+        g_menu_item_set_action_and_target(item, "app.spell-language", "s", tag);
+        g_menu_append_item(languages, item); g_object_unref(item);
+    }
+    if (!state->spell_languages->len) g_menu_append(languages, "No dictionaries installed", NULL);
+    g_menu_append_submenu(spelling, "_Language", G_MENU_MODEL(languages));
+    g_object_unref(languages);
+    return spelling;
+}
+
+static GtkWidget *status_button(const char *label, const char *icon, const char *action, const char *tooltip) {
+    GtkWidget *button = icon ? gtk_button_new_from_icon_name(icon) : gtk_button_new_with_label(label);
+    gtk_widget_add_css_class(button, "flat");
+    gtk_widget_set_focus_on_click(button, FALSE);
+    gtk_widget_set_tooltip_text(button, tooltip);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(button), GTK_ACCESSIBLE_PROPERTY_LABEL, tooltip, -1);
+    gtk_actionable_set_action_name(GTK_ACTIONABLE(button), action);
+    return button;
+}
+
+static void status_popover_closed(GtkPopover *popover, gpointer data) {
+    (void)popover;
+    AppState *state = data;
+    if (!state->closed && !state->disposed && active_state(state) == state)
+        gtk_widget_grab_focus(GTK_WIDGET(state->view));
+}
+
+static void build_status_bar(AppState *state) {
+    state->status = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_add_css_class(state->status, "quillmote-status");
+    state->status_position = status_button("Ln 1, Col 1", NULL, "app.go-to", "Go to line (Ctrl+G)");
+    GtkLabel *position = GTK_LABEL(gtk_button_get_child(GTK_BUTTON(state->status_position)));
+    gtk_label_set_ellipsize(position, PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(position, 18);
+    gtk_box_append(GTK_BOX(state->status), state->status_position);
+    gtk_box_append(GTK_BOX(state->status), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+
+    /* Counts yield space first, leaving the editing controls available. */
+    GtkWidget *counts_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(counts_box, TRUE);
+    state->status_counts = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(state->status_counts), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(state->status_counts), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_hexpand(state->status_counts, TRUE);
+    gtk_box_append(GTK_BOX(counts_box), state->status_counts);
+    gtk_box_append(GTK_BOX(state->status), counts_box);
+    state->status_recovery = gtk_image_new_from_icon_name("dialog-warning-symbolic");
+    gtk_widget_set_tooltip_text(state->status_recovery, "Recovery unavailable");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(state->status_recovery), GTK_ACCESSIBLE_PROPERTY_LABEL, "Recovery unavailable", -1);
+    gtk_box_append(GTK_BOX(state->status), state->status_recovery);
+    state->status_format = gtk_label_new(NULL);
+    gtk_label_set_ellipsize(GTK_LABEL(state->status_format), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(state->status_format), 16);
+    gtk_box_append(GTK_BOX(state->status), state->status_format);
+    gtk_box_append(GTK_BOX(state->status), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+
+    state->status_wrap = gtk_toggle_button_new_with_label("Wrap");
+    gtk_widget_add_css_class(state->status_wrap, "flat");
+    gtk_widget_set_focus_on_click(state->status_wrap, FALSE);
+    gtk_actionable_set_action_name(GTK_ACTIONABLE(state->status_wrap), "app.wrap");
+    gtk_box_append(GTK_BOX(state->status), state->status_wrap);
+    state->status_spelling = gtk_menu_button_new();
+    gtk_widget_add_css_class(state->status_spelling, "flat");
+    GMenu *spelling = build_spelling_menu(state);
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(state->status_spelling), G_MENU_MODEL(spelling));
+    g_object_unref(spelling);
+    configure_menu_popovers(state->status_spelling);
+    g_signal_connect(gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_spelling)), "closed", G_CALLBACK(status_popover_closed), state);
+    gtk_box_append(GTK_BOX(state->status), state->status_spelling);
+    gtk_box_append(GTK_BOX(state->status), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+
+    GtkWidget *zoom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    state->zoom_out = status_button(NULL, "zoom-out-symbolic", "app.zoom-out", "Zoom out (Ctrl+-)");
+    state->zoom_in = status_button(NULL, "zoom-in-symbolic", "app.zoom-in", "Zoom in (Ctrl++)");
+    state->status_zoom = gtk_menu_button_new();
+    gtk_widget_add_css_class(state->status_zoom, "flat");
+    gtk_widget_set_tooltip_text(state->status_zoom, "Change zoom (50–300%)");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(state->status_zoom), GTK_ACCESSIBLE_PROPERTY_LABEL, "Change zoom", -1);
+    GtkWidget *popover = gtk_popover_new();
+    GtkWidget *options = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(options, 8); gtk_widget_set_margin_bottom(options, 8);
+    gtk_widget_set_margin_start(options, 8); gtk_widget_set_margin_end(options, 8);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *label = gtk_label_new_with_mnemonic("_Zoom (%)");
+    state->zoom_value = gtk_spin_button_new_with_range(50, 300, 10);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(state->zoom_value), TRUE);
+    gtk_spin_button_set_update_policy(GTK_SPIN_BUTTON(state->zoom_value), GTK_UPDATE_IF_VALID);
+    gtk_label_set_mnemonic_widget(GTK_LABEL(label), state->zoom_value);
+    gtk_box_append(GTK_BOX(row), label); gtk_box_append(GTK_BOX(row), state->zoom_value);
+    gtk_box_append(GTK_BOX(options), row);
+    GtkWidget *reset = status_button("Reset to 100%", NULL, "app.zoom-reset", "Reset zoom (Ctrl+0)");
+    gtk_box_append(GTK_BOX(options), reset);
+    gtk_popover_set_child(GTK_POPOVER(popover), options);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(state->status_zoom), popover);
+    g_signal_connect(state->zoom_value, "value-changed", G_CALLBACK(status_zoom_changed), state);
+    g_signal_connect(popover, "closed", G_CALLBACK(status_popover_closed), state);
+    gtk_box_append(GTK_BOX(zoom_box), state->zoom_out);
+    gtk_box_append(GTK_BOX(zoom_box), state->status_zoom);
+    gtk_box_append(GTK_BOX(zoom_box), state->zoom_in);
+    gtk_box_append(GTK_BOX(state->status), zoom_box);
+    gtk_widget_set_visible(state->status, state->show_status);
+}
+
 static void create_editor(AppState *state) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     state->page = g_object_ref_sink(root);
@@ -1950,10 +2102,8 @@ static void create_editor(AppState *state) {
     gtk_widget_add_controller(GTK_WIDGET(state->view), context_key);
     GdkRGBA spell_color; gdk_rgba_parse(&spell_color, "#e33b3b");
     gtk_text_buffer_create_tag(GTK_TEXT_BUFFER(state->buffer), "misspelled", "underline", PANGO_UNDERLINE_ERROR, "underline-rgba", &spell_color, NULL);
-    state->status = gtk_label_new(NULL);
-    gtk_label_set_ellipsize(GTK_LABEL(state->status), PANGO_ELLIPSIZE_END);
-    gtk_widget_add_css_class(state->status, "quillmote-status"); gtk_label_set_xalign(GTK_LABEL(state->status), 0);
-    gtk_box_append(GTK_BOX(root), state->status); gtk_widget_set_visible(state->status, state->show_status);
+    build_status_bar(state);
+    gtk_box_append(GTK_BOX(root), state->status);
 
     g_signal_connect(state->buffer, "changed", G_CALLBACK(schedule_spell_scan), state);
     g_signal_connect(state->buffer, "modified-changed", G_CALLBACK(modified_changed), state);
@@ -2156,19 +2306,9 @@ static void activate(GtkApplication *app, gpointer data) {
     append_menu_command(format, "_Word Wrap", "app.wrap");
     append_menu_command(format, "_Font…", "app.font");
     append_menu_command(format, "_Tab Length…", "app.tab-length");
-    GMenu *spelling = g_menu_new(), *languages = g_menu_new();
-    g_menu_append(spelling, "_Check Spelling", "app.spell-enabled");
-    for (guint i = 0; i < state->spell_languages->len; i++) {
-        const char *tag = g_ptr_array_index(state->spell_languages, i);
-        gchar *label = g_strdup(tag); g_strdelimit(label, "_", '-');
-        GMenuItem *item = g_menu_item_new(label, NULL); g_free(label);
-        g_menu_item_set_action_and_target(item, "app.spell-language", "s", tag);
-        g_menu_append_item(languages, item); g_object_unref(item);
-    }
-    if (!state->spell_languages->len) g_menu_append(languages, "No dictionaries installed", NULL);
-    g_menu_append_submenu(spelling, "_Language", G_MENU_MODEL(languages));
+    GMenu *spelling = build_spelling_menu(state);
     g_menu_append_submenu(format, "_Spelling", G_MENU_MODEL(spelling));
-    g_object_unref(spelling); g_object_unref(languages);
+    g_object_unref(spelling);
     GMenu *view = g_menu_new();
     section = append_menu_section(view);
     append_menu_command(section, "_Status Bar", "app.status-bar");
@@ -2289,6 +2429,9 @@ static void dispose_document(AppState *state) {
     if (state->broker_free && state->broker) state->broker_free(state->broker);
     if (state->css) gtk_style_context_remove_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->css));
     g_clear_object(&state->css);
+    g_signal_handlers_disconnect_by_data(state->zoom_value, state);
+    g_signal_handlers_disconnect_by_data(gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_zoom)), state);
+    g_signal_handlers_disconnect_by_data(gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_spelling)), state);
     g_clear_object(&state->page);
     if (state->buffer) {
         /* GTK's primary-selection provider can retain a buffer after its view

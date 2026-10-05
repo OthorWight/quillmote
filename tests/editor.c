@@ -69,10 +69,10 @@ static void check_counts_search(AppState *state) {
     const char *text = "café can't 123\nHola\t世界 e\314\201  !";
     gtk_text_buffer_set_text(GTK_TEXT_BUFFER(state->buffer), text, -1); settle(state);
     g_assert_cmpuint(state->document_count.words, ==, 6);
-    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(state->status)), "6 words"));
+    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(state->status_counts)), "6 words"));
     select_range(state, 0, 10); settle(state);
     g_assert_cmpuint(state->selection_count.words, ==, 2);
-    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(state->status)), "Selection: 2 words · 10 characters"));
+    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(state->status_counts)), "Selection: 2 words · 10 characters"));
     gtk_text_buffer_set_modified(GTK_TEXT_BUFFER(state->buffer), FALSE);
     g_action_group_change_action_state(G_ACTION_GROUP(state->app), "invisible-characters", g_variant_new_boolean(TRUE));
     g_assert_true(gtk_source_space_drawer_get_enable_matrix(gtk_source_view_get_space_drawer(state->view)));
@@ -104,6 +104,126 @@ static void check_counts_search(AppState *state) {
     gtk_editable_set_text(GTK_EDITABLE(state->find_entry), ""); show_find(state, FALSE); settle(state);
     g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(state->search_count)), ==, "");
     close_find(NULL, state);
+}
+static GtkWidget *status_menu_item(GtkWidget *widget, const char *label) {
+    if (GTK_IS_LABEL(widget) && g_strcmp0(gtk_label_get_text(GTK_LABEL(widget)), label) == 0) {
+        for (GtkWidget *parent = gtk_widget_get_parent(widget); parent; parent = gtk_widget_get_parent(parent))
+            if (g_str_equal(G_OBJECT_TYPE_NAME(parent), "GtkModelButton")) return parent;
+    }
+    for (GtkWidget *child = gtk_widget_get_first_child(widget); child; child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *found = status_menu_item(child, label); if (found) return found;
+    }
+    return NULL;
+}
+static void capture_status_widget(GtkWidget *widget, const char *directory, const char *name) {
+    graphene_rect_t bounds; g_assert_true(gtk_widget_compute_bounds(widget, widget, &bounds));
+    int width = (int)bounds.size.width, height = (int)bounds.size.height;
+    GdkPaintable *paintable = gtk_widget_paintable_new(widget);
+    GtkSnapshot *snapshot = gtk_snapshot_new();
+    if (GTK_IS_POPOVER(widget)) gdk_paintable_snapshot(paintable, snapshot, width, height);
+    else gtk_widget_snapshot_child(gtk_widget_get_parent(widget), widget, snapshot);
+    GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
+    g_assert_nonnull(node);
+    graphene_rect_t viewport = GRAPHENE_RECT_INIT(0, 0, width, height);
+    GdkTexture *texture = gsk_renderer_render_texture(gtk_native_get_renderer(gtk_widget_get_native(widget)), node, &viewport);
+    gchar *path = g_build_filename(directory, name, NULL);
+    g_assert_true(gdk_texture_save_to_png(texture, path));
+    g_print("Status screenshot: %s\n", path);
+    g_free(path); g_object_unref(texture); gsk_render_node_unref(node); g_object_unref(paintable);
+}
+static void check_status_controls(AppState *state, const char *directory) {
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
+    gtk_text_buffer_set_text(buffer, "Status bar controls\nZoom, wrap, and spelling", -1);
+    gtk_text_buffer_set_modified(buffer, FALSE);
+    select_range(state, 23, 23); settle(state);
+    g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(state->status_position)), ==, "Ln 2, Col 4");
+    PangoFontDescription *font = pango_font_description_copy(state->font);
+
+    gtk_editable_set_text(GTK_EDITABLE(state->zoom_value), "137");
+    gtk_spin_button_update(GTK_SPIN_BUTTON(state->zoom_value));
+    g_assert_cmpint(state->zoom, ==, 137);
+    g_signal_emit_by_name(state->zoom_in, "clicked");
+    g_assert_cmpint(state->zoom, ==, 147);
+    g_signal_emit_by_name(state->zoom_out, "clicked");
+    g_assert_cmpint(state->zoom, ==, 137);
+    g_assert_cmpstr(gtk_menu_button_get_label(GTK_MENU_BUTTON(state->status_zoom)), ==, "137%");
+    action(state, "zoom-in");
+    g_assert_cmpint(gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(state->zoom_value)), ==, 147);
+    GtkWidget *reset = button_named(GTK_WIDGET(gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_zoom))), "Reset to 100%");
+    g_assert_nonnull(reset); g_signal_emit_by_name(reset, "clicked");
+    g_assert_cmpint(state->zoom, ==, 100);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(state->zoom_value), 50);
+    g_assert_false(gtk_widget_get_sensitive(state->zoom_out));
+    action(state, "zoom-out"); g_assert_cmpint(state->zoom, ==, 50);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(state->zoom_value), 300);
+    g_assert_false(gtk_widget_get_sensitive(state->zoom_in));
+    action(state, "zoom-in"); g_assert_cmpint(state->zoom, ==, 300);
+    action(state, "zoom-reset");
+    g_assert_true(pango_font_description_equal(font, state->font));
+    pango_font_description_free(font);
+    g_assert_false(gtk_text_buffer_get_modified(buffer));
+
+    gboolean wrap = state->word_wrap;
+    g_signal_emit_by_name(state->status_wrap, "clicked");
+    g_assert_cmpint(state->word_wrap, ==, !wrap);
+    g_assert_cmpint(gtk_text_view_get_wrap_mode(GTK_TEXT_VIEW(state->view)), ==, !wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
+    g_action_group_change_action_state(G_ACTION_GROUP(state->app), "wrap", g_variant_new_boolean(wrap));
+    g_assert_cmpint(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(state->status_wrap)), ==, wrap);
+
+    GtkPopover *popup = gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_zoom));
+    gtk_popover_set_autohide(popup, FALSE);
+    gtk_menu_button_popup(GTK_MENU_BUTTON(state->status_zoom)); flush_events();
+    g_assert_true(gtk_widget_get_mapped(GTK_WIDGET(popup)));
+    capture_status_widget(GTK_WIDGET(popup), directory, "status-zoom.png");
+    g_assert_true(menu_escape(NULL, GDK_KEY_Escape, 0, 0, state)); flush_events();
+    g_assert_false(gtk_widget_get_visible(GTK_WIDGET(popup)));
+    g_assert_true(gtk_root_get_focus(GTK_ROOT(state->window)) == GTK_WIDGET(state->view));
+    gtk_popover_set_autohide(popup, TRUE);
+    GtkPopover *spell_popup = gtk_menu_button_get_popover(GTK_MENU_BUTTON(state->status_spelling));
+    gtk_popover_set_autohide(spell_popup, FALSE);
+    gtk_menu_button_popup(GTK_MENU_BUTTON(state->status_spelling)); flush_events();
+    GtkWidget *check = status_menu_item(GTK_WIDGET(spell_popup), "Check Spelling");
+    g_assert_nonnull(check);
+    gboolean spell = state->spell_enabled;
+    g_assert_true(gtk_widget_activate(check)); flush_events();
+    g_assert_cmpint(state->spell_enabled, ==, !spell);
+    g_assert_false(gtk_widget_get_visible(GTK_WIDGET(spell_popup)));
+    g_assert_true(gtk_root_get_focus(GTK_ROOT(state->window)) == GTK_WIDGET(state->view));
+    g_action_group_change_action_state(G_ACTION_GROUP(state->app), "spell-enabled", g_variant_new_boolean(spell));
+    gtk_popover_set_autohide(spell_popup, TRUE);
+    g_signal_emit_by_name(state->status_position, "clicked"); answer(state, "Cancel");
+
+    AppState *second = new_tab(state); settle(state);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(second->zoom_value), 90);
+    select_tab(state);
+    g_signal_emit_by_name(state->zoom_in, "clicked");
+    g_assert_cmpint(state->zoom, ==, 110); g_assert_cmpint(second->zoom, ==, 90);
+    select_tab(second); g_signal_emit_by_name(second->zoom_out, "clicked");
+    g_assert_cmpint(second->zoom, ==, 80); g_assert_cmpint(state->zoom, ==, 110);
+    close_tab(second); settle(state); action(state, "zoom-reset");
+
+    TextEncoding encoding = state->encoding; LineEnding ending = state->ending;
+    state->encoding = ENCODING_UTF16_LE; state->ending = ENDING_CRLF; update_status(state);
+    g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(state->status_format)), ==, "UTF-16 LE · CRLF");
+    state->encoding = ENCODING_BYTES; update_status(state);
+    g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(state->status_format)), ==, "Raw bytes");
+    g_assert_cmpstr(gtk_menu_button_get_label(GTK_MENU_BUTTON(state->status_spelling)), ==, "Spell: Off");
+    state->encoding = encoding; state->ending = ending; update_status(state);
+    g_action_group_change_action_state(G_ACTION_GROUP(state->app), "word-count", g_variant_new_boolean(FALSE));
+    g_assert_false(gtk_widget_get_visible(state->status_counts));
+    g_action_group_change_action_state(G_ACTION_GROUP(state->app), "word-count", g_variant_new_boolean(TRUE));
+    settle(state);
+    /* Allocate the bar directly because a tiling desktop can ignore window sizes. */
+    flush_events();
+    graphene_rect_t bounds;
+    g_assert_true(gtk_widget_compute_bounds(state->status, state->status, &bounds));
+    gtk_widget_allocate(state->status, 640, (int)bounds.size.height, -1, NULL);
+    g_assert_cmpint(gtk_widget_get_width(state->status), <=, 640);
+    g_assert_true(gtk_widget_compute_bounds(state->zoom_in, state->status, &bounds));
+    g_assert_cmpfloat(bounds.origin.x + bounds.size.width, <=, gtk_widget_get_width(state->status));
+    capture_status_widget(state->status, directory, "status-narrow.png");
+    gtk_widget_queue_allocate(state->page); flush_events();
+    g_assert_false(gtk_text_buffer_get_modified(buffer));
 }
 static void check_auto_indent(AppState *state) {
     const struct { const char *before; int cursor; const char *after; } cases[] = {
@@ -261,6 +381,7 @@ int main(int argc, char **argv) {
     select_tab(&state);
     check_counts_search(&state);
     check_auto_indent(&state);
+    check_status_controls(&state, directory);
     check_tabs(&state, directory);
     shutdown_app(G_APPLICATION(app), &state); g_object_unref(app); g_free(directory);
     g_print("Counts, invisible characters, search feedback, independent tabs, close/save/cancel, and multi-tab crash recovery passed.\n");

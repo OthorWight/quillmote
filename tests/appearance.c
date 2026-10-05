@@ -333,7 +333,7 @@ int main(void) {
     g_assert_true(g_menu_model_get_item_attribute(format, 1, G_MENU_ATTRIBUTE_ACTION, "s", &font_action));
     g_assert_cmpstr(font_action, ==, "app.font");
     g_assert_nonnull(g_action_map_lookup_action(G_ACTION_MAP(app), "font"));
-    g_assert_cmpint(g_menu_model_get_n_items(format), ==, 3);
+    g_assert_cmpint(g_menu_model_get_n_items(format), ==, 4);
     g_assert_null(g_action_map_lookup_action(G_ACTION_MAP(app), "dark-mode"));
     g_assert_null(g_action_map_lookup_action(G_ACTION_MAP(app), "correct"));
     GMenuModel *edit = g_menu_model_get_item_link(menu, 1, G_MENU_LINK_SUBMENU);
