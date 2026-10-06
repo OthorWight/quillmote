@@ -3,6 +3,7 @@
 ## 0.1.0 — initial public build preparation
 
 - Restore saved files, tab order, active tab, cursor positions, and zoom after quitting.
+- Detect external file changes with OS notifications and focus checks; offer Refresh with confirmation for unsaved edits and protect detected changes when saving.
 - Remember Open and Save As folders and the default zoom between launches.
 - Plain-text editing with tabs, independent undo histories, and drag-and-drop.
 - Enter continues the current line's spaces and tabs; Shift+Enter inserts an unindented line break.

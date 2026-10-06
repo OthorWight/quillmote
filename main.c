@@ -80,6 +80,15 @@ typedef struct AppState {
     gboolean word_wrap, show_status;
     PrintOptions printing;
     gchar *filename;
+    GFile *watched_file;
+    GFileMonitor *file_monitor;
+    GObject *watch_lifetime; /* Weak callback token; cleared before tab disposal. */
+    GCancellable *disk_cancel;
+    gchar *disk_checksum; /* Raw bytes from the last successful load/save. */
+    guint disk_debounce;
+    guint64 disk_epoch;
+    gboolean disk_check_again, disk_changed, disk_unavailable;
+    GtkWidget *change_bar, *change_label, *refresh_button;
     guint spell_idle;
     guint64 document_revision;
     GMenu *spelling_menu;
@@ -137,6 +146,10 @@ static void schedule_counts(AppState *state, gboolean changed);
 static void update_search_count(AppState *state);
 static void queue_search_count(AppState *state);
 static void status_zoom_changed(GtkSpinButton *spin, gpointer data);
+static void watch_file(AppState *state, const gchar *checksum);
+static void stop_watching(AppState *state);
+static void queue_disk_check(AppState *state);
+static void update_change_notice(AppState *state);
 
 static void apply_editor_style(AppState *state) {
     const PangoFontDescription *font = state->font;
@@ -175,10 +188,13 @@ static void update_title(AppState *state) {
     gchar *name = state->filename ? g_path_get_basename(state->filename) : g_strdup("Untitled");
     gchar *title = g_strdup_printf("%s%s%s - Quillmote", modified ? "*" : "", name, state->recovered ? " (Recovered)" : "");
     if (state->tab_label) {
-        gchar *tab = g_strdup_printf("%s%s", modified ? "*" : "", name);
+        gchar *tab = g_strdup_printf("%s%s%s", modified ? "*" : "", name, state->disk_changed ? " ↻" : "");
         gtk_label_set_width_chars(GTK_LABEL(state->tab_label), CLAMP(g_utf8_strlen(tab, -1), 8, 24));
         gtk_label_set_text(GTK_LABEL(state->tab_label), tab); g_free(tab);
-        gtk_widget_set_tooltip_text(state->tab_label, state->filename ? state->filename : "Untitled");
+        gchar *tip = g_strdup_printf("%s%s", state->filename ? state->filename : "Untitled",
+            state->disk_unavailable && state->disk_changed ? "\nFile unavailable on disk — your text is kept in this tab." :
+            state->disk_changed ? "\nFile changed on disk — Refresh to load the latest version." : "");
+        gtk_widget_set_tooltip_text(state->tab_label, tip); g_free(tip);
     }
     if (active_state(state) == state) gtk_window_set_title(GTK_WINDOW(state->window), title);
     g_free(name);
@@ -278,28 +294,32 @@ static gboolean save_contents(AppState *state, const char *filename, TextEncodin
         gsize size;
         const gchar *data = g_bytes_get_data(bytes, &size);
         saved = g_file_set_contents(filename, data, size, &error);
-        g_bytes_unref(bytes);
     }
     if (saved) {
         recovery_clear(state);
         gchar *name = g_strdup(filename);
         g_free(state->filename); state->filename = name;
         state->encoding = encoding; state->ending = ending;
+        gsize size;
+        const guchar *data = g_bytes_get_data(bytes, &size);
+        gchar *checksum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, data, size);
+        watch_file(state, checksum); g_free(checksum);
         gtk_text_buffer_set_modified(GTK_TEXT_BUFFER(state->buffer), FALSE);
         update_title(state); update_status(state);
     } else {
         show_error(state, "Could not save file", error);
         g_clear_error(&error);
     }
+    g_clear_pointer(&bytes, g_bytes_unref);
     return saved;
 }
 
 struct LoadJob {
     AppState *state;
-    gchar *path;
+    gchar *path, *checksum;
     int requested_encoding, restore_cursor;
     gboolean from_session;
-    gboolean create, recover;
+    gboolean create, recover, refresh;
     RecoverySession *claimed;
     RecoveryDocument *document;
     GtkSourceBuffer *staging;
@@ -329,6 +349,7 @@ static void loading_controls(AppState *state, gboolean loading) {
     gtk_widget_set_sensitive(GTK_WIDGET(state->view), !loading);
     gtk_widget_set_sensitive(state->find_bar, !loading);
     gtk_widget_set_sensitive(state->status, !loading);
+    update_change_notice(state);
     if (active_state(state) != state) return;
     gchar **names = g_action_group_list_actions(G_ACTION_GROUP(state->app));
     for (int i = 0; names[i]; i++) {
@@ -338,6 +359,7 @@ static void loading_controls(AppState *state, gboolean loading) {
         g_simple_action_set_enabled(G_SIMPLE_ACTION(action), !loading);
     }
     g_strfreev(names);
+    update_change_notice(state);
 }
 
 static void load_finished(LoadJob *job, GError *error) {
@@ -350,11 +372,11 @@ static void load_finished(LoadJob *job, GError *error) {
     g_clear_object(&state->load_cancel);
     loading_controls(state, FALSE);
     if (error && !job->from_session && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        show_error(state, job->recover ? "Could not recover document" : "Could not open file", error);
+        show_error(state, job->recover ? "Could not recover document" : job->refresh ? "Could not refresh file" : "Could not open file", error);
     g_clear_error(&error);
     recovery_session_free(job->claimed);
     recovery_document_free(job->document);
-    g_clear_object(&job->staging); g_free(job->path); g_free(job);
+    g_clear_object(&job->staging); g_free(job->path); g_free(job->checksum); g_free(job);
     if (after != PENDING_NONE) request_document_change(state, after);
     else if (failed_restore) close_tab(state);
     AppState *window = window_state(state);
@@ -366,6 +388,7 @@ static void load_finished(LoadJob *job, GError *error) {
         }
         if (!loading) restore_session(window);
     }
+    if (!state->disposed) queue_disk_check(state);
     g_application_release(G_APPLICATION(state->app));
 }
 
@@ -396,12 +419,13 @@ static gboolean insert_loaded_chunk(gpointer data) {
     }
     g_free(state->filename); state->filename = g_strdup(job->document->filename);
     state->encoding = job->document->encoding; state->ending = job->document->ending;
+    watch_file(state, job->checksum);
     gtk_text_buffer_set_enable_undo(GTK_TEXT_BUFFER(job->staging), TRUE);
     bind_buffer(state, job->staging);
     GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
     gtk_text_buffer_set_modified(buffer, job->recover);
     const char *text = job->document->text;
-    if (!job->recover && state->encoding != ENCODING_BYTES &&
+    if (!job->recover && !job->refresh && state->encoding != ENCODING_BYTES &&
         (g_str_equal(text, ".LOG") || g_str_has_prefix(text, ".LOG\n"))) {
         gtk_text_buffer_get_end_iter(buffer, &iter);
         gchar *stamp = time_date();
@@ -437,6 +461,7 @@ static void read_document_thread(GTask *task, gpointer source, gpointer task_dat
             if (parent_info && g_file_info_get_file_type(parent_info) == G_FILE_TYPE_DIRECTORY) {
                 job->document = g_new0(RecoveryDocument, 1);
                 job->document->text = g_strdup("");
+                job->checksum = g_strdup(""); /* A named file that does not yet exist. */
             } else if (!error) g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY,
                                                     "The parent folder does not exist.");
             g_clear_object(&parent_info); g_clear_object(&parent);
@@ -445,6 +470,7 @@ static void read_document_thread(GTask *task, gpointer source, gpointer task_dat
         } else if (info) {
             gchar *contents = NULL; gsize length;
             if (g_file_load_contents(file, cancel, &contents, &length, NULL, &error)) {
+                job->checksum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar *)contents, length);
                 job->document = g_new0(RecoveryDocument, 1);
                 job->document->text = decode_document(contents, length, job->requested_encoding,
                     &job->document->encoding, &job->document->ending, &error);
@@ -494,6 +520,204 @@ static gboolean load_file_full(AppState *state, const char *path, int encoding, 
 
 static gboolean load_file(AppState *state, const char *path, int encoding) {
     return load_file_full(state, path, encoding, FALSE, FALSE);
+}
+
+/* Notifications are hints: confirm raw contents off the UI thread. A digest
+ * avoids retaining a second copy of every open file, including large files. */
+typedef struct {
+    GWeakRef lifetime;
+    GFile *file;
+    guint64 epoch;
+} DiskCheck;
+
+static void disk_check_free(gpointer data) {
+    DiskCheck *check = data;
+    g_weak_ref_clear(&check->lifetime);
+    g_object_unref(check->file); g_free(check);
+}
+
+static void update_change_notice(AppState *state) {
+    if (!state->change_bar || state->disposed) return;
+    gboolean modified = state->buffer && gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer));
+    gtk_label_set_text(GTK_LABEL(state->change_label), state->disk_unavailable ?
+        "File unavailable on disk. Your text is kept here; you can save it with Save As." : modified ?
+        "File changed on disk. Refresh to load it; your unsaved edits will need to be discarded." :
+        "File changed on disk. Refresh to load the latest version.");
+    gtk_widget_set_visible(state->change_bar, state->disk_changed);
+    gtk_widget_set_sensitive(state->refresh_button, !state->busy && !state->disk_unavailable);
+    GAction *action = state->app ? g_action_map_lookup_action(G_ACTION_MAP(state->app), "refresh") : NULL;
+    if (action && active_state(state) == state)
+        g_simple_action_set_enabled(G_SIMPLE_ACTION(action), state->filename && !state->busy);
+}
+
+static void disk_check_thread(GTask *task, gpointer source, gpointer data, GCancellable *cancel) {
+    (void)source;
+    DiskCheck *check = data;
+    GError *error = NULL;
+    GFileInfo *info = g_file_query_info(check->file, G_FILE_ATTRIBUTE_STANDARD_TYPE,
+        G_FILE_QUERY_INFO_NONE, cancel, &error);
+    if (!info && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
+        g_clear_error(&error);
+        g_task_return_pointer(task, g_strdup(""), g_free); return;
+    }
+    if (info && g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR)
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE, "This is no longer a regular file.");
+    g_clear_object(&info);
+    GFileInputStream *stream = error ? NULL : g_file_read(check->file, cancel, &error);
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    if (stream) {
+        guchar chunk[32768];
+        gssize length;
+        while ((length = g_input_stream_read(G_INPUT_STREAM(stream), chunk, sizeof chunk, cancel, &error)) > 0)
+            g_checksum_update(checksum, chunk, length);
+        g_object_unref(stream);
+    }
+    if (error) g_task_return_error(task, error);
+    else g_task_return_pointer(task, g_strdup(g_checksum_get_string(checksum)), g_free);
+    g_checksum_free(checksum);
+}
+
+static void disk_checked(GObject *source, GAsyncResult *result, gpointer data) {
+    (void)data;
+    DiskCheck *check = g_task_get_task_data(G_TASK(result));
+    GError *error = NULL;
+    gchar *checksum = g_task_propagate_pointer(G_TASK(result), &error);
+    GObject *lifetime = g_weak_ref_get(&check->lifetime);
+    AppState *state = lifetime ? g_object_get_data(lifetime, "document") : NULL;
+    if (state && !state->disposed && state->disk_epoch == check->epoch) {
+        g_clear_object(&state->disk_cancel);
+        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            /* Recovered work has no original disk snapshot. Establish one,
+             * retaining the recovered buffer and its modified flag. */
+            if (!state->disk_checksum && checksum) state->disk_checksum = g_strdup(checksum);
+            state->disk_unavailable = error || (checksum && !*checksum);
+            state->disk_changed = error || g_strcmp0(state->disk_checksum, checksum) != 0;
+            if (state->recovered && state->disk_unavailable) state->disk_changed = TRUE;
+            update_change_notice(state); update_title(state);
+        }
+        if (state->disk_check_again) {
+            state->disk_check_again = FALSE; queue_disk_check(state);
+        }
+    }
+    g_clear_object(&lifetime); g_clear_error(&error); g_free(checksum);
+    g_application_release(G_APPLICATION(source));
+}
+
+static gboolean check_disk(gpointer data) {
+    AppState *state = data;
+    state->disk_debounce = 0;
+    if (state->disposed || !state->watched_file) return G_SOURCE_REMOVE;
+    if (state->loading || state->disk_cancel) {
+        state->disk_check_again = TRUE; return G_SOURCE_REMOVE;
+    }
+    state->disk_check_again = FALSE;
+    DiskCheck *check = g_new0(DiskCheck, 1);
+    g_weak_ref_init(&check->lifetime, state->watch_lifetime);
+    check->file = g_object_ref(state->watched_file); check->epoch = state->disk_epoch;
+    state->disk_cancel = g_cancellable_new();
+    g_application_hold(G_APPLICATION(state->app));
+    GTask *task = g_task_new(state->app, state->disk_cancel, disk_checked, NULL);
+    g_task_set_task_data(task, check, disk_check_free);
+    g_task_run_in_thread(task, disk_check_thread); g_object_unref(task);
+    return G_SOURCE_REMOVE;
+}
+
+static void queue_disk_check(AppState *state) {
+    if (state->disposed || !state->watched_file) return;
+    if (state->disk_debounce) g_source_remove(state->disk_debounce);
+    state->disk_debounce = g_timeout_add(150, check_disk, state);
+}
+
+static void file_changed(GFileMonitor *monitor, GFile *file, GFile *other,
+                         GFileMonitorEvent event, gpointer data) {
+    (void)monitor;
+    AppState *state = data;
+    if ((file && g_file_equal(file, state->watched_file)) ||
+        (other && g_file_equal(other, state->watched_file)) ||
+        event == G_FILE_MONITOR_EVENT_UNMOUNTED || event == G_FILE_MONITOR_EVENT_PRE_UNMOUNT)
+        queue_disk_check(state);
+}
+
+static void stop_watching(AppState *state) {
+    state->disk_epoch++;
+    if (state->disk_debounce) { g_source_remove(state->disk_debounce); state->disk_debounce = 0; }
+    if (state->disk_cancel) g_cancellable_cancel(state->disk_cancel);
+    g_clear_object(&state->disk_cancel);
+    if (state->file_monitor) {
+        g_signal_handlers_disconnect_by_data(state->file_monitor, state);
+        g_file_monitor_cancel(state->file_monitor);
+    }
+    g_clear_object(&state->file_monitor); g_clear_object(&state->watched_file);
+    g_clear_pointer(&state->disk_checksum, g_free);
+    state->disk_check_again = state->disk_changed = state->disk_unavailable = FALSE;
+}
+
+static void watch_file(AppState *state, const gchar *checksum) {
+    stop_watching(state);
+    if (!state->watch_lifetime) {
+        state->watch_lifetime = g_object_new(G_TYPE_OBJECT, NULL);
+        g_object_set_data(state->watch_lifetime, "document", state);
+    }
+    state->disk_checksum = g_strdup(checksum);
+    if (state->filename) {
+        state->watched_file = g_file_new_for_path(state->filename);
+        GFile *parent = g_file_get_parent(state->watched_file);
+        if (parent) {
+            state->file_monitor = g_file_monitor_directory(parent, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
+            g_object_unref(parent);
+        }
+        if (state->file_monitor)
+            g_signal_connect(state->file_monitor, "changed", G_CALLBACK(file_changed), state);
+        /* Also closes the read/setup race and establishes a recovery baseline. */
+        queue_disk_check(state);
+    }
+    update_change_notice(state);
+}
+
+static void window_focus_changed(GObject *object, GParamSpec *spec, gpointer data) {
+    (void)spec;
+    AppState *window = data;
+    if (!gtk_window_is_active(GTK_WINDOW(object)) || !window->tabs) return;
+    for (guint i = 0; i < window->tabs->len; i++) queue_disk_check(g_ptr_array_index(window->tabs, i));
+}
+
+static void refresh_file(AppState *state) {
+    GtkTextIter cursor;
+    gtk_text_buffer_get_iter_at_mark(GTK_TEXT_BUFFER(state->buffer), &cursor,
+        gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(state->buffer)));
+    if (load_file(state, state->filename, -1)) {
+        state->loading->refresh = TRUE;
+        state->loading->restore_cursor = gtk_text_iter_get_offset(&cursor);
+    }
+}
+
+static void refresh_answer(GObject *source, GAsyncResult *result, gpointer data) {
+    AppState *state = data;
+    GError *error = NULL;
+    int answer = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source), result, &error);
+    g_clear_error(&error); state->busy = FALSE;
+    if (answer == 1 && !state->disposed) refresh_file(state);
+    update_change_notice(state);
+}
+
+static void refresh_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    AppState *state = data;
+    if (state->busy || state->disposed || !state->filename) return;
+    if (!gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer))) { refresh_file(state); return; }
+    state->busy = TRUE; update_change_notice(state);
+    GtkAlertDialog *dialog = gtk_alert_dialog_new("Discard unsaved edits and refresh?");
+    gtk_alert_dialog_set_detail(dialog, "Refresh loads the latest file from disk. Your unsaved edits will be lost. Use Save As first if you want to keep a copy.");
+    const char *buttons[] = {"Cancel", "Discard and Refresh", NULL};
+    gtk_alert_dialog_set_buttons(dialog, buttons);
+    gtk_alert_dialog_set_cancel_button(dialog, 0); gtk_alert_dialog_set_default_button(dialog, 0);
+    gtk_alert_dialog_set_modal(dialog, TRUE);
+    gtk_alert_dialog_choose(dialog, GTK_WINDOW(state->window), NULL, refresh_answer, state);
+    g_object_unref(dialog);
+}
+
+static void action_refresh(GSimpleAction *action, GVariant *parameter) {
+    (void)parameter; refresh_clicked(NULL, action_state(action));
 }
 
 static void cancel_load(GtkButton *button, gpointer data) {
@@ -619,7 +843,31 @@ static void choose_file(AppState *state, gboolean save) {
 }
 G_GNUC_END_IGNORE_DEPRECATIONS
 
+static void replace_disk_answer(GObject *source, GAsyncResult *result, gpointer data) {
+    AppState *state = data;
+    GError *error = NULL;
+    int answer = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source), result, &error);
+    g_clear_error(&error);
+    if (answer == 1) choose_file(state, TRUE);
+    else if (answer == 2) {
+        if (save_contents(state, state->filename, state->encoding, state->ending)) perform_pending(state);
+        else cancel_pending(state);
+    } else cancel_pending(state);
+    update_change_notice(state);
+}
+
 static void save_file(AppState *state) {
+    if (state->filename && state->disk_changed && !state->disk_unavailable) {
+        state->busy = TRUE; update_change_notice(state);
+        GtkAlertDialog *dialog = gtk_alert_dialog_new("Replace the changed file on disk?");
+        gtk_alert_dialog_set_detail(dialog, "The file changed outside Quillmote. Save As keeps your text in a separate file; Replace overwrites the disk version with your text.");
+        const char *buttons[] = {"Cancel", "Save As", "Replace", NULL};
+        gtk_alert_dialog_set_buttons(dialog, buttons);
+        gtk_alert_dialog_set_cancel_button(dialog, 0); gtk_alert_dialog_set_default_button(dialog, 0);
+        gtk_alert_dialog_set_modal(dialog, TRUE);
+        gtk_alert_dialog_choose(dialog, GTK_WINDOW(state->window), NULL, replace_disk_answer, state);
+        g_object_unref(dialog); return;
+    }
     if (state->filename) {
         if (save_contents(state, state->filename, state->encoding, state->ending)) perform_pending(state);
         else cancel_pending(state);
@@ -635,7 +883,9 @@ static void perform_pending(AppState *state) {
         gtk_text_buffer_set_enable_undo(buffer, FALSE);
         gtk_text_buffer_set_text(buffer, "", 0);
         gtk_text_buffer_set_enable_undo(buffer, TRUE);
+        stop_watching(state);
         g_clear_pointer(&state->filename, g_free);
+        update_change_notice(state);
         state->encoding = ENCODING_UTF8; state->ending = ENDING_LF;
         gtk_text_buffer_set_modified(buffer, FALSE);
         update_title(state); update_status(state);
@@ -1590,6 +1840,7 @@ static void save_preferences(AppState *state) {
 }
 
 static void modified_changed(GtkTextBuffer *buffer, gpointer data) {
+    update_change_notice(data);
     AppState *state = data;
     if (!gtk_text_buffer_get_modified(buffer)) recovery_clear(state);
     update_title(state);
@@ -1829,6 +2080,7 @@ static void sync_tab_actions(AppState *state) {
     if (language) g_simple_action_set_state(G_SIMPLE_ACTION(language), g_variant_new_string(state->spell_language ? state->spell_language : ""));
     gboolean busy = state->busy;
     loading_controls(state, state->loading != NULL); state->busy = busy;
+    update_change_notice(state);
     spelling_actions_enabled(state, FALSE);
 }
 
@@ -1838,6 +2090,7 @@ static void tab_switched(GtkNotebook *notebook, GtkWidget *page, guint index, gp
     if (!state || state->closed) return;
     window->active = state;
     sync_tab_actions(state); update_title(state); update_status(state);
+    queue_disk_check(state);
     gtk_widget_grab_focus(GTK_WIDGET(state->view));
 }
 
@@ -2061,6 +2314,25 @@ static void create_editor(AppState *state) {
     g_signal_connect(recover, "clicked", G_CALLBACK(recover_clicked), state);
     gtk_box_append(GTK_BOX(root), state->recovery_bar); gtk_widget_set_visible(state->recovery_bar, FALSE);
 
+    state->change_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_add_css_class(state->change_bar, "find-bar");
+    gtk_widget_set_margin_start(state->change_bar, 8);
+    gtk_widget_set_margin_end(state->change_bar, 8);
+    gtk_widget_set_margin_top(state->change_bar, 6);
+    gtk_widget_set_margin_bottom(state->change_bar, 6);
+    state->change_label = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(state->change_label), 0);
+    gtk_label_set_wrap(GTK_LABEL(state->change_label), TRUE);
+    gtk_widget_set_hexpand(state->change_label, TRUE);
+    gtk_box_append(GTK_BOX(state->change_bar), state->change_label);
+    state->refresh_button = gtk_button_new_with_mnemonic("_Refresh");
+    gtk_widget_set_valign(state->refresh_button, GTK_ALIGN_CENTER);
+    gtk_widget_set_tooltip_text(state->refresh_button, "Load the latest version from disk (Ctrl+Shift+R)");
+    g_signal_connect(state->refresh_button, "clicked", G_CALLBACK(refresh_clicked), state);
+    gtk_box_append(GTK_BOX(state->change_bar), state->refresh_button);
+    gtk_box_append(GTK_BOX(root), state->change_bar);
+    gtk_widget_set_visible(state->change_bar, FALSE);
+
     state->buffer = gtk_source_buffer_new(NULL);
     state->css = gtk_css_provider_new();
     gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -2203,6 +2475,7 @@ static const struct {
     {"new", G_CALLBACK(action_new), {"<Primary>t", "<Primary>n"}, FALSE},
     {"open", G_CALLBACK(action_open), {"<Primary>o"}, FALSE},
     {"save", G_CALLBACK(action_save), {"<Primary>s"}, FALSE},
+    {"refresh", G_CALLBACK(action_refresh), {"<Primary><Shift>r"}, FALSE},
     {"save-as", G_CALLBACK(action_save_as), {"<Primary><Shift>s"}, FALSE},
     {"page-setup", G_CALLBACK(action_page_setup), {NULL}, FALSE},
     {"print", G_CALLBACK(action_print), {"<Primary>p"}, FALSE},
@@ -2261,6 +2534,7 @@ static void activate(GtkApplication *app, gpointer data) {
     enchant_setup(state);
     state->window = gtk_application_window_new(app);
     g_signal_connect(state->window, "close-request", G_CALLBACK(close_requested), state);
+    g_signal_connect(state->window, "notify::is-active", G_CALLBACK(window_focus_changed), state);
     gtk_window_set_default_size(GTK_WINDOW(state->window), state->window_width, state->window_height);
     if (state->maximized) gtk_window_maximize(GTK_WINDOW(state->window));
     g_signal_connect(state->window, "notify::default-width", G_CALLBACK(remember_window), state);
@@ -2278,6 +2552,7 @@ static void activate(GtkApplication *app, gpointer data) {
     section = append_menu_section(file);
     append_menu_command(section, "_Save", "app.save");
     append_menu_command(section, "Save _As…", "app.save-as");
+    append_menu_command(section, "_Refresh from Disk", "app.refresh");
     section = append_menu_section(file);
     append_menu_command(section, "Page Set_up…", "app.page-setup");
     append_menu_command(section, "_Print…", "app.print");
@@ -2412,6 +2687,8 @@ static void open_files(GApplication *application, GFile **files, gint count, con
 static void dispose_document(AppState *state) {
     if (state->disposed) return;
     state->disposed = TRUE;
+    stop_watching(state);
+    g_clear_object(&state->watch_lifetime);
     if (state->count_idle) g_source_remove(state->count_idle);
     if (state->search_idle) g_source_remove(state->search_idle);
     g_clear_object(&state->search_context);

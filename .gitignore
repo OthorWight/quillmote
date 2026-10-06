@@ -9,3 +9,4 @@ tests/memory
 /build/
 /dist/
 tests/session
+tests/file-changes

@@ -26,12 +26,18 @@ Print the application version and exit, without opening a display.
 Show command-line usage and exit.
 .SH SHORTCUTS
 Ctrl+N or Ctrl+T creates a tab; Ctrl+O opens files; Ctrl+S saves;
-Ctrl+Shift+S opens Save As. Ctrl+W closes a tab and Ctrl+Q exits.
+Ctrl+Shift+S opens Save As. Ctrl+Shift+R refreshes from disk. Ctrl+W closes a tab and Ctrl+Q exits.
 Ctrl+Tab and Ctrl+Shift+Tab switch tabs.
 .PP
 Ctrl+F opens Find; Ctrl+H reveals Replace; F3 finds the next match.
 Escape closes Find. Ctrl+G goes to a line. F5 inserts the date and time.
 Ctrl++ and Ctrl+- zoom, and Ctrl+0 resets zoom. F1 opens the offline guide.
+.SH EXTERNAL CHANGES
+Changes made outside Quillmote show a Refresh banner and a marker on the tab.
+Files are also checked when the window regains focus or a tab becomes active.
+Refresh asks before discarding unsaved edits; cancellation or failure keeps the text.
+Save asks before overwriting a detected external change. Deleted or unavailable
+files stay open; use Save As to keep a separate copy.
 .SH SPELLING
 Spell checking uses the optional Enchant 2 runtime and installed dictionaries.
 Select a dictionary under Format, Spelling, Language.

@@ -220,7 +220,7 @@ static void check_visible_shortcuts(AppState *state, const char *directory) {
     GMenuModel *model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(bar));
     guint hints = 0;
     check_menu_shortcuts(model, state->app, &hints);
-    g_assert_cmpuint(hints, ==, 25);
+    g_assert_cmpuint(hints, ==, 26);
     GtkWidget *file = gtk_widget_get_first_child(bar);
     GtkWidget *save = menu_button_with_text(bar, "Save");
     g_assert_nonnull(save);
