@@ -177,6 +177,8 @@ typedef struct AppState {
     GtkCssProvider *css;
     PangoFontDescription *font;
     gboolean dark_mode;
+    GSettings *interface_settings; /* Window-level appearance subscription. */
+    GtkCssProvider *theme_css;
     int window_width, window_height, zoom, tab_width;
     gboolean maximized, spell_enabled;
     gchar *spell_language;
@@ -248,20 +250,27 @@ static void apply_editor_style(AppState *state) {
     PangoStyle style = pango_font_description_get_style(font);
     char *css = g_strdup_printf(
         "#editor-%p { font-family: '%s'; font-size: %s%s; font-weight: %d; font-style: %s; } "
-        ".quillmote-status { padding: 3px 8px; background: %s; color: %s; } "
+        ".quillmote-status { padding: 3px 8px; background: shade(@theme_bg_color, 0.96); color: @theme_fg_color; } "
         ".quillmote-status button { padding: 3px 6px; min-height: 22px; min-width: 0; } "
         ".quillmote-status separator { margin: 3px 4px; } "
-        ".find-bar { padding: 5px; background: %s; } "
+        ".find-bar { padding: 5px; background: @theme_bg_color; color: @theme_fg_color; } "
         ".quillmote-titlebar { padding: 0 6px; } "
         ".quillmote-tabs { padding: 0; border: 0; margin: 0; } "
         ".quillmote-tabs > header > tabs { padding: 0; border: 0; margin: 0; } "
         ".quillmote-tabs > header { background: transparent; border: 0; margin: 0; padding: 0; } "
-        ".quillmote-tabs > header > tabs > tab { min-height: 32px; padding: 0 10px; }",
+        ".quillmote-tabs > header > tabs > tab { min-height: 28px; padding: 0 10px; margin: 3px; "
+        "border-radius: 8px; border: 1px solid alpha(currentColor, 0.12); "
+        "background-color: alpha(currentColor, 0.06); background-image: none; box-shadow: none; } "
+        ".quillmote-tabs > header > tabs > tab:hover { "
+        "background-color: alpha(currentColor, 0.10); border-color: alpha(currentColor, 0.20); } "
+        ".quillmote-tabs > header > tabs > tab:checked { "
+        "background-color: alpha(@theme_selected_bg_color, 0.18); "
+        "border-color: alpha(@theme_selected_bg_color, 0.8); } "
+        ".quillmote-tabs > header > tabs > tab:checked:hover { "
+        "background-color: alpha(@theme_selected_bg_color, 0.24); }",
         (void *)state, escaped_family->str, size, pango_font_description_get_size_is_absolute(font) ? "px" : "pt",
         pango_font_description_get_weight(font),
-        style == PANGO_STYLE_ITALIC ? "italic" : style == PANGO_STYLE_OBLIQUE ? "oblique" : "normal",
-        state->dark_mode ? "#252525" : "#d9d9d9", state->dark_mode ? "#eeeeee" : "#222222",
-        state->dark_mode ? "#303030" : "#e5e5e5");
+        style == PANGO_STYLE_ITALIC ? "italic" : style == PANGO_STYLE_OBLIQUE ? "oblique" : "normal");
     gtk_css_provider_load_from_string(state->css, css);
     g_free(css);
     g_string_free(escaped_family, TRUE);
@@ -1575,25 +1584,94 @@ static void action_about(GSimpleAction *action, GVariant *parameter) {
 
 static void system_theme_changed(GtkSettings *settings, GParamSpec *pspec, gpointer data) {
     (void)pspec;
-    AppState *state = data;
+    AppState *window = data;
     gboolean dark = FALSE;
+    gchar *theme = NULL;
+    g_object_get(settings, "gtk-application-prefer-dark-theme", &dark, "gtk-theme-name", &theme, NULL);
+    gchar *lower = g_ascii_strdown(theme ? theme : "", -1);
+    dark = dark || strstr(lower, "dark") != NULL;
+    g_free(lower);
 #if GTK_CHECK_VERSION(4, 20, 0)
     GtkInterfaceColorScheme scheme;
     g_object_get(settings, "gtk-interface-color-scheme", &scheme, NULL);
     if (scheme == GTK_INTERFACE_COLOR_SCHEME_DARK || scheme == GTK_INTERFACE_COLOR_SCHEME_LIGHT) {
         dark = scheme == GTK_INTERFACE_COLOR_SCHEME_DARK;
-    } else
-#endif
-    {
-        gchar *theme = NULL;
-        g_object_get(settings, "gtk-application-prefer-dark-theme", &dark, "gtk-theme-name", &theme, NULL);
-        gchar *lower = g_ascii_strdown(theme ? theme : "", -1);
-        dark = dark || strstr(lower, "dark") != NULL;
-        g_free(lower);
-        g_free(theme);
     }
-    state->dark_mode = dark;
-    apply_editor_style(state);
+#endif
+    /* Some shells update the desktop preference but leave both the portal and
+     * GTK theme name stale. An explicit desktop choice wins over those defaults.
+     * Merely having the GNOME schema installed does not imply a preference. */
+    if (window->interface_settings) {
+        gchar *preference = g_settings_get_string(window->interface_settings, "color-scheme");
+        if (g_str_equal(preference, "prefer-dark") || g_str_equal(preference, "prefer-light")) {
+            dark = g_str_equal(preference, "prefer-dark");
+        }
+        g_free(preference);
+    }
+    const char *theme_override = g_getenv("GTK_THEME");
+    if (theme_override && *theme_override) {
+        /* An intentional per-process theme override remains authoritative. */
+        lower = g_ascii_strdown(theme_override, -1);
+        dark = strstr(lower, "dark") != NULL;
+        g_free(lower);
+    }
+    window->dark_mode = dark;
+    if (!theme_override || !*theme_override) {
+        if (!window->theme_css) {
+            window->theme_css = gtk_css_provider_new();
+            gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+                GTK_STYLE_PROVIDER(window->theme_css), GTK_STYLE_PROVIDER_PRIORITY_SETTINGS + 1);
+        }
+        /* Use the desktop's theme family, choosing its light/dark variant for
+         * every native widget (including menus and dialogs). Do not pin or write
+         * GtkSettings: later desktop theme changes must still reach us. */
+        if (!theme || !*theme) { g_free(theme); theme = g_strdup("Adwaita"); }
+        lower = g_ascii_strdown(theme, -1);
+        if (g_str_has_suffix(lower, "-dark")) theme[strlen(theme) - 5] = '\0';
+        g_free(lower);
+        G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+        gtk_css_provider_load_named(window->theme_css, theme, dark ? "dark" : NULL);
+        G_GNUC_END_IGNORE_DEPRECATIONS
+#if GTK_CHECK_VERSION(4, 20, 0)
+        g_object_set(window->theme_css, "prefers-color-scheme",
+                     dark ? GTK_INTERFACE_COLOR_SCHEME_DARK : GTK_INTERFACE_COLOR_SCHEME_LIGHT, NULL);
+#endif
+    } else if (window->theme_css) {
+        gtk_style_context_remove_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(window->theme_css));
+        g_clear_object(&window->theme_css);
+    }
+    g_free(theme);
+    for (guint i = 0; window->tabs && i < window->tabs->len; i++) {
+        AppState *tab = g_ptr_array_index(window->tabs, i);
+        if (tab->disposed) continue;
+        tab->dark_mode = dark;
+        apply_editor_style(tab);
+    }
+}
+
+static void desktop_color_scheme_changed(GSettings *settings, gchar *key, gpointer data) {
+    (void)settings; (void)key;
+    system_theme_changed(gtk_settings_get_default(), NULL, data);
+}
+
+static void follow_system_appearance(AppState *window) {
+    GSettingsSchemaSource *source = g_settings_schema_source_get_default();
+    GSettingsSchema *schema = source ? g_settings_schema_source_lookup(source, "org.gnome.desktop.interface", TRUE) : NULL;
+    if (schema) {
+        if (g_settings_schema_has_key(schema, "color-scheme")) {
+            window->interface_settings = g_settings_new_full(schema, NULL, NULL);
+            g_signal_connect(window->interface_settings, "changed::color-scheme",
+                             G_CALLBACK(desktop_color_scheme_changed), window);
+        }
+        g_settings_schema_unref(schema);
+    }
+    GtkSettings *settings = gtk_settings_get_default();
+#if GTK_CHECK_VERSION(4, 20, 0)
+    g_signal_connect(settings, "notify::gtk-interface-color-scheme", G_CALLBACK(system_theme_changed), window);
+#endif
+    g_signal_connect(settings, "notify::gtk-theme-name", G_CALLBACK(system_theme_changed), window);
+    g_signal_connect(settings, "notify::gtk-application-prefer-dark-theme", G_CALLBACK(system_theme_changed), window);
+    system_theme_changed(settings, NULL, window);
 }
 
 static void font_dialog_done(GObject *source, GAsyncResult *result, gpointer data) {
@@ -2502,13 +2580,8 @@ static void create_editor(AppState *state) {
     g_signal_connect(state->buffer, "changed", G_CALLBACK(schedule_spell_scan), state);
     g_signal_connect(state->buffer, "modified-changed", G_CALLBACK(modified_changed), state);
     g_signal_connect(state->buffer, "mark-set", G_CALLBACK(cursor_moved), state);
-    GtkSettings *settings = gtk_settings_get_default();
-#if GTK_CHECK_VERSION(4, 20, 0)
-    g_signal_connect(settings, "notify::gtk-interface-color-scheme", G_CALLBACK(system_theme_changed), state);
-#endif
-    g_signal_connect(settings, "notify::gtk-theme-name", G_CALLBACK(system_theme_changed), state);
-    g_signal_connect(settings, "notify::gtk-application-prefer-dark-theme", G_CALLBACK(system_theme_changed), state);
-    system_theme_changed(settings, NULL, state);
+    state->dark_mode = window_state(state)->dark_mode;
+    apply_editor_style(state);
     update_title(state); update_status(state);
     state->recovery_directory = g_build_filename(g_get_user_config_dir(), "quillmote", "recovery", NULL);
     GError *recovery_error = NULL;
@@ -2650,6 +2723,7 @@ static void activate(GtkApplication *app, gpointer data) {
     AppState *state = data;
     if (state->window) { gtk_window_present(GTK_WINDOW(state->window)); return; }
     state->app = app;
+    follow_system_appearance(state);
     gtk_icon_theme_add_resource_path(gtk_icon_theme_get_for_display(gdk_display_get_default()), "/org/quillmote/Quillmote/icons");
     gtk_window_set_default_icon_name(QUILLMOTE_APP_ID);
     load_preferences(state);
@@ -2847,7 +2921,6 @@ static void dispose_document(AppState *state) {
     recovery_session_free(state->recovery); g_free(state->recovery_directory);
     g_clear_pointer(&state->spell_languages, g_ptr_array_unref); g_free(state->spell_language);
     print_options_clear(&state->printing);
-    g_signal_handlers_disconnect_by_data(gtk_settings_get_default(), state);
     if (state->spell_idle) g_source_remove(state->spell_idle);
     g_clear_object(&state->spelling_menu);
     if (state->broker_free_dict && state->dictionary) state->broker_free_dict(state->broker, state->dictionary);
@@ -2872,6 +2945,11 @@ static void dispose_document(AppState *state) {
 
 static void shutdown_app(GApplication *application, gpointer data) {
     (void)application; AppState *state = data;
+    g_signal_handlers_disconnect_by_data(gtk_settings_get_default(), state);
+    if (state->interface_settings) g_signal_handlers_disconnect_by_data(state->interface_settings, state);
+    g_clear_object(&state->interface_settings);
+    if (state->theme_css) gtk_style_context_remove_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(state->theme_css));
+    g_clear_object(&state->theme_css);
     if (state->active && !state->active->disposed) save_preferences(state->active);
     for (guint i = 0; state->tabs && i < state->tabs->len; i++) {
         AppState *tab = g_ptr_array_index(state->tabs, i);

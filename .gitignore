@@ -1,5 +1,6 @@
 quillmote
 tests/appearance
+tests/themes
 tests/document
 tests/features
 tests/workflows

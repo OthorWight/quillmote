@@ -1,6 +1,6 @@
 # Quillmote
 
-A simple, comfortable text editor for Linux, built with GTK 4 and GtkSourceView 5. The title bar, menus, and editor follow the system's light/dark appearance, including changes while the app is open. Font settings are preserved.
+A simple, comfortable text editor for Linux, built with GTK 4 and GtkSourceView 5. The title bar, menus, tabs, editor, search controls, status bar, and dialogs follow the system's light/dark appearance at startup and while the app is open. Font settings are preserved.
 
 ## Build and run
 

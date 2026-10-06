@@ -22,7 +22,17 @@ static void assert_font(AppState *state, const PangoFontDescription *rendered_fo
 }
 
 static void simulate_system_theme(gboolean dark) {
-    /* This overrides settings only inside the test process, not on the desktop. */
+    /* The memory backend keeps this preference inside the test process. */
+    GSettingsSchemaSource *source = g_settings_schema_source_get_default();
+    GSettingsSchema *schema = source ? g_settings_schema_source_lookup(source, "org.gnome.desktop.interface", TRUE) : NULL;
+    if (schema) {
+        if (g_settings_schema_has_key(schema, "color-scheme")) {
+            GSettings *desktop = g_settings_new_full(schema, NULL, NULL);
+            g_assert_true(g_settings_set_string(desktop, "color-scheme", dark ? "prefer-dark" : "prefer-light"));
+            g_object_unref(desktop);
+        }
+        g_settings_schema_unref(schema);
+    }
 #if GTK_CHECK_VERSION(4, 20, 0)
     g_object_set(gtk_settings_get_default(), "gtk-interface-color-scheme",
                  dark ? GTK_INTERFACE_COLOR_SCHEME_DARK : GTK_INTERFACE_COLOR_SCHEME_LIGHT, NULL);
@@ -324,6 +334,7 @@ int main(void) {
     gchar *test_directory = g_dir_make_tmp("quillmote-tests-XXXXXX", &setup_error);
     g_assert_no_error(setup_error);
     g_setenv("XDG_CONFIG_HOME", test_directory, TRUE);
+    g_setenv("GSETTINGS_BACKEND", "memory", TRUE);
     gtk_init();
     AppState state = {0};
     GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID ".AppearanceTest", G_APPLICATION_NON_UNIQUE);
