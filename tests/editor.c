@@ -262,6 +262,14 @@ static void check_tabs(AppState *root, const char *directory) {
     action(root, "new"); AppState *second = active_state(root);
     g_assert_true(second != root); g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->notebook)), ==, 2);
     assert_text(root, "first draft");
+    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->tab_strip)), ==, 2);
+    /* Clicking a header tab switches the actual editor; shortcuts select it back. */
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(root->tab_strip), 0);
+    g_assert_true(active_state(root) == root);
+    g_assert_cmpint(gtk_notebook_get_current_page(GTK_NOTEBOOK(root->notebook)), ==, 0);
+    action(root, "next-tab");
+    g_assert_true(active_state(root) == second);
+    g_assert_cmpint(gtk_notebook_get_current_page(GTK_NOTEBOOK(root->tab_strip)), ==, 1);
     gtk_text_buffer_insert_at_cursor(GTK_TEXT_BUFFER(second->buffer), "second draft", -1);
     action(root, "previous-tab"); g_assert_true(active_state(root) == root);
     GtkTextIter cursor; gtk_text_buffer_get_iter_at_mark(GTK_TEXT_BUFFER(root->buffer), &cursor, gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(root->buffer)));
@@ -283,6 +291,8 @@ static void check_tabs(AppState *root, const char *directory) {
     g_free(second->filename); second->filename = g_build_filename(directory, "second.txt", NULL);
     gchar *saved_path = g_strdup(second->filename);
     action(root, "close-tab"); answer(root, "Save"); g_assert_true(second->closed);
+    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->tab_strip)), ==,
+                    gtk_notebook_get_n_pages(GTK_NOTEBOOK(root->notebook)));
     gchar *disk; g_assert_true(g_file_get_contents(saved_path, &disk, NULL, NULL)); g_free(saved_path);
     g_assert_cmpstr(disk, ==, "second draft"); g_free(disk);
 

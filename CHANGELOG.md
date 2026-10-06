@@ -6,6 +6,7 @@
 - Detect external file changes with OS notifications and focus checks; offer Refresh with confirmation for unsaved edits and protect detected changes when saving.
 - Remember Open and Save As folders and the default zoom between launches.
 - Plain-text editing with tabs, independent undo histories, and drag-and-drop.
+- Compact title row with menus, tabs, and a new-tab button directly after the tabs.
 - Enter continues the current line's spaces and tabs; Shift+Enter inserts an unindented line break.
 - Find and replace with highlighted matches, counts, and collapsible replacement controls.
 - Word and character counts, invisible-character display, and zoom.

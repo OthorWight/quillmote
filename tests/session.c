@@ -103,7 +103,9 @@ int main(void) {
     g_assert_cmpstr(c->filename, ==, copy);
     g_assert_cmpstr(first.last_save_folder, ==, save_folder);
     close_tab(c);
-    gtk_notebook_reorder_child(GTK_NOTEBOOK(first.notebook), b->page, 0);
+    /* Header drag order must become the document order persisted on quit. */
+    gtk_notebook_reorder_child(GTK_NOTEBOOK(first.tab_strip), b->tab_page, 0);
+    g_assert_cmpint(gtk_notebook_page_num(GTK_NOTEBOOK(first.notebook), b->page), ==, 0);
     select_tab(a);
     stop(&first, app);
     Session *saved = session_load();
@@ -117,6 +119,8 @@ int main(void) {
     a = page(&second, 1); b = page(&second, 0);
     g_assert_cmpstr(a->filename, ==, one); g_assert_cmpstr(b->filename, ==, two);
     g_assert_true(second.active == a);
+    g_assert_cmpint(gtk_notebook_page_num(GTK_NOTEBOOK(second.tab_strip), b->tab_page), ==, 0);
+    g_assert_cmpint(gtk_notebook_get_current_page(GTK_NOTEBOOK(second.tab_strip)), ==, 1);
     g_assert_cmpint(cursor(a), ==, 5); g_assert_cmpint(cursor(b), ==, 8);
     g_assert_cmpint(a->zoom, ==, 130); g_assert_cmpint(b->zoom, ==, 90);
     g_assert_cmpstr(second.last_open_folder, ==, open_folder);

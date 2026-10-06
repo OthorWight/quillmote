@@ -336,7 +336,7 @@ int main(void) {
     flush_events();
 
     GtkWidget *root = gtk_window_get_child(GTK_WINDOW(state.window));
-    g_assert_true(GTK_IS_HEADER_BAR(gtk_window_get_titlebar(GTK_WINDOW(state.window))));
+    g_assert_true(GTK_IS_WINDOW_HANDLE(gtk_window_get_titlebar(GTK_WINDOW(state.window))));
     g_assert_true(gtk_widget_get_first_child(root) == state.notebook);
     GtkWidget *menubar = find_menu_bar(gtk_window_get_titlebar(GTK_WINDOW(state.window)));
     g_assert_nonnull(menubar);

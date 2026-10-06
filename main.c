@@ -37,6 +37,86 @@ static void queue_memory_release(void) {
 #endif
 }
 
+/* A scrollable notebook requests only one tab's width. Allocate enough for
+ * all tabs when space permits, then put + beside that width instead of at
+ * the far edge of the window. GTK still manages overflow and tab dragging. */
+typedef struct { GtkWidget parent; GtkWidget *notebook, *button; } TabRow;
+typedef struct { GtkWidgetClass parent; } TabRowClass;
+G_DEFINE_TYPE(TabRow, tab_row, GTK_TYPE_WIDGET)
+
+static int tab_row_tabs_width(TabRow *row) {
+    int width = 0;
+    int count = gtk_notebook_get_n_pages(GTK_NOTEBOOK(row->notebook));
+    for (int i = 0; i < count; i++) {
+        GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(row->notebook), i);
+        GtkWidget *label = gtk_notebook_get_tab_label(GTK_NOTEBOOK(row->notebook), page);
+        int natural;
+        gtk_widget_measure(gtk_widget_get_parent(label), GTK_ORIENTATION_HORIZONTAL, -1, NULL, &natural, NULL, NULL);
+        width += natural;
+    }
+    return width;
+}
+
+static void tab_row_measure(GtkWidget *widget, GtkOrientation orientation, int for_size,
+                            int *minimum, int *natural, int *min_baseline, int *nat_baseline) {
+    TabRow *row = (TabRow *)widget;
+    int tab_min, tab_nat, button_min, button_nat;
+    gtk_widget_measure(row->notebook, orientation, for_size, &tab_min, &tab_nat, NULL, NULL);
+    gtk_widget_measure(row->button, orientation, for_size, &button_min, &button_nat, NULL, NULL);
+    *minimum = orientation == GTK_ORIENTATION_HORIZONTAL ? tab_min + button_min : MAX(tab_min, button_min);
+    *natural = orientation == GTK_ORIENTATION_HORIZONTAL ? MAX(tab_nat, tab_row_tabs_width(row)) + button_nat : MAX(tab_nat, button_nat);
+    *min_baseline = *nat_baseline = -1;
+}
+
+static void tab_row_allocate(GtkWidget *widget, int width, int height, int baseline) {
+    (void)baseline;
+    TabRow *row = (TabRow *)widget;
+    int button_width, button_height, tab_min;
+    gtk_widget_measure(row->button, GTK_ORIENTATION_HORIZONTAL, -1, NULL, &button_width, NULL, NULL);
+    gtk_widget_measure(row->button, GTK_ORIENTATION_VERTICAL, button_width, NULL, &button_height, NULL, NULL);
+    gtk_widget_measure(row->notebook, GTK_ORIENTATION_HORIZONTAL, -1, &tab_min, NULL, NULL, NULL);
+    int tab_width = MIN(MAX(tab_min, tab_row_tabs_width(row)), MAX(0, width - button_width));
+    gboolean rtl = gtk_widget_get_direction(widget) == GTK_TEXT_DIR_RTL;
+    graphene_point_t tabs_at = GRAPHENE_POINT_INIT(rtl ? width - tab_width : 0, 0);
+    gtk_widget_allocate(row->notebook, tab_width, height, -1, gsk_transform_translate(NULL, &tabs_at));
+    graphene_point_t button_at = GRAPHENE_POINT_INIT(rtl ? width - tab_width - button_width : tab_width,
+                                                    (height - MIN(height, button_height)) / 2);
+    gtk_widget_allocate(row->button, button_width, MIN(height, button_height), -1,
+                        gsk_transform_translate(NULL, &button_at));
+}
+
+static void tab_row_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
+    TabRow *row = (TabRow *)widget;
+    gtk_widget_snapshot_child(widget, row->notebook, snapshot);
+    gtk_widget_snapshot_child(widget, row->button, snapshot);
+}
+
+static void tab_row_dispose(GObject *object) {
+    TabRow *row = (TabRow *)object;
+    if (row->notebook) { gtk_widget_unparent(row->notebook); row->notebook = NULL; }
+    if (row->button) { gtk_widget_unparent(row->button); row->button = NULL; }
+    G_OBJECT_CLASS(tab_row_parent_class)->dispose(object);
+}
+
+static void tab_row_class_init(TabRowClass *class) {
+    GtkWidgetClass *widget = GTK_WIDGET_CLASS(class);
+    widget->measure = tab_row_measure; widget->size_allocate = tab_row_allocate;
+    widget->snapshot = tab_row_snapshot;
+    gtk_widget_class_set_css_name(widget, "tabrow");
+    gtk_widget_class_set_accessible_role(widget, GTK_ACCESSIBLE_ROLE_GROUP);
+    G_OBJECT_CLASS(class)->dispose = tab_row_dispose;
+}
+
+static void tab_row_init(TabRow *row) { gtk_widget_set_hexpand(GTK_WIDGET(row), TRUE); }
+
+static GtkWidget *tab_row_new(GtkWidget *notebook, GtkWidget *button) {
+    TabRow *row = g_object_new(tab_row_get_type(), NULL);
+    row->notebook = notebook; row->button = button;
+    gtk_widget_set_parent(notebook, GTK_WIDGET(row));
+    gtk_widget_set_parent(button, GTK_WIDGET(row));
+    return GTK_WIDGET(row);
+}
+
 typedef enum { PENDING_NONE, PENDING_NEW, PENDING_QUIT, PENDING_CLOSE } PendingAction;
 
 typedef struct LoadJob LoadJob;
@@ -50,6 +130,8 @@ typedef struct AppState {
     struct AppState *owner, *active;
     GPtrArray *tabs; /* Window owns live and retired callback records until shutdown. */
     GtkWidget *notebook, *page, *tab_label;
+    GtkWidget *tab_strip, *tab_page, *new_tab_button;
+    gboolean syncing_tab_order, syncing_tab_selection;
     gboolean closed, disposed, closing_window;
     PendingAction after_load;
     Session *closing_session;
@@ -169,7 +251,12 @@ static void apply_editor_style(AppState *state) {
         ".quillmote-status { padding: 3px 8px; background: %s; color: %s; } "
         ".quillmote-status button { padding: 3px 6px; min-height: 22px; min-width: 0; } "
         ".quillmote-status separator { margin: 3px 4px; } "
-        ".find-bar { padding: 5px; background: %s; }",
+        ".find-bar { padding: 5px; background: %s; } "
+        ".quillmote-titlebar { padding: 0 6px; } "
+        ".quillmote-tabs { padding: 0; border: 0; margin: 0; } "
+        ".quillmote-tabs > header > tabs { padding: 0; border: 0; margin: 0; } "
+        ".quillmote-tabs > header { background: transparent; border: 0; margin: 0; padding: 0; } "
+        ".quillmote-tabs > header > tabs > tab { min-height: 32px; padding: 0 10px; }",
         (void *)state, escaped_family->str, size, pango_font_description_get_size_is_absolute(font) ? "px" : "pt",
         pango_font_description_get_weight(font),
         style == PANGO_STYLE_ITALIC ? "italic" : style == PANGO_STYLE_OBLIQUE ? "oblique" : "normal",
@@ -2089,9 +2176,38 @@ static void tab_switched(GtkNotebook *notebook, GtkWidget *page, guint index, gp
     AppState *window = data, *state = g_object_get_data(G_OBJECT(page), "document");
     if (!state || state->closed) return;
     window->active = state;
+    if (state->tab_page && !window->syncing_tab_selection) {
+        window->syncing_tab_selection = TRUE;
+        int position = gtk_notebook_page_num(GTK_NOTEBOOK(window->tab_strip), state->tab_page);
+        if (position >= 0) gtk_notebook_set_current_page(GTK_NOTEBOOK(window->tab_strip), position);
+        window->syncing_tab_selection = FALSE;
+    }
     sync_tab_actions(state); update_title(state); update_status(state);
     queue_disk_check(state);
     gtk_widget_grab_focus(GTK_WIDGET(state->view));
+}
+
+/* The header notebook supplies GTK's tab selection, scrolling, and drag
+ * behavior. The document notebook below it owns the full-size editor pages. */
+static void header_tab_switched(GtkNotebook *notebook, GtkWidget *page, guint index, gpointer data) {
+    (void)notebook; (void)index;
+    AppState *window = data;
+    AppState *state = g_object_get_data(G_OBJECT(page), "document");
+    if (!state || state->closed || window->syncing_tab_selection) return;
+    window->syncing_tab_selection = TRUE;
+    select_tab(state);
+    window->syncing_tab_selection = FALSE;
+}
+
+static void tab_reordered(GtkNotebook *notebook, GtkWidget *page, guint position, gpointer data) {
+    AppState *window = data;
+    AppState *state = g_object_get_data(G_OBJECT(page), "document");
+    if (window->syncing_tab_order || !state || state->closed || !state->tab_page) return;
+    window->syncing_tab_order = TRUE;
+    gboolean header = GTK_WIDGET(notebook) == window->tab_strip;
+    gtk_notebook_reorder_child(GTK_NOTEBOOK(header ? window->notebook : window->tab_strip),
+                              header ? state->page : state->tab_page, position);
+    window->syncing_tab_order = FALSE;
 }
 
 static void tab_close_clicked(GtkButton *button, gpointer data) {
@@ -2115,8 +2231,11 @@ static void attach_tab(AppState *state) {
     g_signal_connect(close, "clicked", G_CALLBACK(tab_close_clicked), state);
     gtk_box_append(GTK_BOX(label), close);
     g_ptr_array_add(window->tabs, state);
-    gtk_notebook_append_page(GTK_NOTEBOOK(window->notebook), state->page, label);
-    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(window->notebook), state->page, TRUE);
+    gtk_notebook_append_page(GTK_NOTEBOOK(window->notebook), state->page, NULL);
+    state->tab_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    g_object_set_data(G_OBJECT(state->tab_page), "document", state);
+    gtk_notebook_append_page(GTK_NOTEBOOK(window->tab_strip), state->tab_page, label);
+    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(window->tab_strip), state->tab_page, TRUE);
     select_tab(state); update_title(state);
 }
 
@@ -2168,6 +2287,9 @@ static void close_tab(AppState *state) {
     int index = gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), state->page);
     if (window->active == state) window->active = NULL;
     gtk_notebook_remove_page(GTK_NOTEBOOK(window->notebook), index);
+    int header_index = gtk_notebook_page_num(GTK_NOTEBOOK(window->tab_strip), state->tab_page);
+    gtk_notebook_remove_page(GTK_NOTEBOOK(window->tab_strip), header_index);
+    state->tab_page = state->tab_label = NULL;
     dispose_document(state);
     queue_memory_release();
     if (window->closing_window) quit_window(window);
@@ -2540,8 +2662,15 @@ static void activate(GtkApplication *app, gpointer data) {
     g_signal_connect(state->window, "notify::default-width", G_CALLBACK(remember_window), state);
     g_signal_connect(state->window, "notify::default-height", G_CALLBACK(remember_window), state);
     g_signal_connect(state->window, "notify::maximized", G_CALLBACK(remember_window), state);
-    GtkWidget *header = gtk_header_bar_new();
+    GtkWidget *header = gtk_window_handle_new();
+    GtkWidget *header_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(header_row, "quillmote-titlebar");
+    gtk_window_handle_set_child(GTK_WINDOW_HANDLE(header), header_row);
     gtk_window_set_titlebar(GTK_WINDOW(state->window), header);
+    GtkWidget *start_controls = gtk_window_controls_new(GTK_PACK_START);
+    g_object_bind_property(start_controls, "empty", start_controls, "visible",
+                           G_BINDING_SYNC_CREATE | G_BINDING_INVERT_BOOLEAN);
+    gtk_box_append(GTK_BOX(header_row), start_controls);
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_window_set_child(GTK_WINDOW(state->window), root);
 
@@ -2609,7 +2738,8 @@ static void activate(GtkApplication *app, gpointer data) {
     g_menu_append_submenu(menubar, "F_ormat", G_MENU_MODEL(format)); g_menu_append_submenu(menubar, "_View", G_MENU_MODEL(view)); g_menu_append_submenu(menubar, "_Help", G_MENU_MODEL(help));
     GtkWidget *menu_bar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(menubar));
     configure_menu_popovers(menu_bar);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), menu_bar);
+    gtk_widget_set_valign(menu_bar, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(header_row), menu_bar);
     GtkEventController *escape = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(escape, GTK_PHASE_CAPTURE);
     g_signal_connect(escape, "key-pressed", G_CALLBACK(menu_escape), state);
@@ -2617,13 +2747,27 @@ static void activate(GtkApplication *app, gpointer data) {
     g_object_unref(file); g_object_unref(edit); g_object_unref(format); g_object_unref(view); g_object_unref(help); g_object_unref(menubar);
 
     state->notebook = gtk_notebook_new();
-    gtk_notebook_set_scrollable(GTK_NOTEBOOK(state->notebook), TRUE);
+    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(state->notebook), FALSE);
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(state->notebook), FALSE);
+    state->tab_strip = gtk_notebook_new();
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(state->tab_strip), TRUE);
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(state->tab_strip), FALSE);
+    gtk_widget_add_css_class(state->tab_strip, "quillmote-tabs");
+    gtk_widget_set_hexpand(state->tab_strip, TRUE);
     GtkWidget *new_button = gtk_button_new_from_icon_name("list-add-symbolic");
     gtk_widget_add_css_class(new_button, "flat");
     gtk_widget_set_tooltip_text(new_button, "New tab (Ctrl+T)");
     gtk_accessible_update_property(GTK_ACCESSIBLE(new_button), GTK_ACCESSIBLE_PROPERTY_LABEL, "New tab", -1);
     gtk_actionable_set_action_name(GTK_ACTIONABLE(new_button), "app.new");
-    gtk_notebook_set_action_widget(GTK_NOTEBOOK(state->notebook), new_button, GTK_PACK_END);
+    state->new_tab_button = new_button;
+    gtk_widget_set_valign(new_button, GTK_ALIGN_CENTER);
+    GtkWidget *tab_group = tab_row_new(state->tab_strip, new_button);
+    gtk_widget_set_margin_start(tab_group, 8);
+    gtk_box_append(GTK_BOX(header_row), tab_group);
+    GtkWidget *end_controls = gtk_window_controls_new(GTK_PACK_END);
+    g_object_bind_property(end_controls, "empty", end_controls, "visible",
+                           G_BINDING_SYNC_CREATE | G_BINDING_INVERT_BOOLEAN);
+    gtk_box_append(GTK_BOX(header_row), end_controls);
     gtk_widget_set_vexpand(state->notebook, TRUE);
     gtk_box_append(GTK_BOX(root), state->notebook);
     state->tabs = g_ptr_array_new(); state->active = state;
@@ -2664,6 +2808,9 @@ static void activate(GtkApplication *app, gpointer data) {
     add_toggle(state, "invisible-characters", state->show_invisibles, G_CALLBACK(set_invisibles_state));
     sync_tab_actions(state);
     g_signal_connect(state->notebook, "switch-page", G_CALLBACK(tab_switched), state);
+    g_signal_connect(state->tab_strip, "switch-page", G_CALLBACK(header_tab_switched), state);
+    g_signal_connect(state->notebook, "page-reordered", G_CALLBACK(tab_reordered), state);
+    g_signal_connect(state->tab_strip, "page-reordered", G_CALLBACK(tab_reordered), state);
     gtk_window_present(GTK_WINDOW(state->window)); gtk_widget_grab_focus(GTK_WIDGET(state->view));
     state->recovery_start_idle = g_idle_add(startup_recovery, state);
 }
