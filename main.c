@@ -4,6 +4,7 @@
 #include <pango/pango.h>
 #include <string.h>
 #include "document.h"
+#include "fileio.h"
 #include "printing.h"
 #include "recovery.h"
 #include "session.h"
@@ -172,6 +173,9 @@ typedef struct AppState {
     gboolean disk_check_again, disk_changed, disk_unavailable;
     GtkWidget *change_bar, *change_label, *refresh_button;
     guint spell_idle;
+    GArray *spell_ranges;
+    guint spell_range;
+    gboolean spell_dirty;
     guint64 document_revision;
     GMenu *spelling_menu;
     GtkCssProvider *css;
@@ -361,13 +365,14 @@ static void perform_pending(AppState *state);
 static void choose_file(AppState *state, gboolean save);
 static void request_document_change(AppState *state, PendingAction pending);
 static void schedule_spell_scan(GtkTextBuffer *buffer, gpointer data);
+static void spelling_view_changed(gpointer object, gpointer data);
 static void cursor_moved(GtkTextBuffer *buffer, GtkTextIter *location, GtkTextMark *mark, gpointer data);
 static void modified_changed(GtkTextBuffer *buffer, gpointer data);
 static void recovery_clear(AppState *state);
 static void recovery_refresh(AppState *state);
 static void save_preferences(AppState *state);
 
-static gchar *buffer_text(AppState *state) {
+static G_GNUC_UNUSED gchar *buffer_text(AppState *state) {
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(GTK_TEXT_BUFFER(state->buffer), &start, &end);
     return gtk_text_buffer_get_text(GTK_TEXT_BUFFER(state->buffer), &start, &end, FALSE);
@@ -380,33 +385,52 @@ static gchar *time_date(void) {
     return stamp;
 }
 
+static gboolean write_buffer_chunks(AppState *state, int fd, TextEncoding encoding,
+                                    LineEnding ending, GChecksum *checksum, GError **error) {
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(GTK_TEXT_BUFFER(state->buffer), &start);
+    gboolean first = TRUE;
+    do {
+        end = start; gtk_text_iter_forward_chars(&end, 32768);
+        gchar *text = gtk_text_buffer_get_text(GTK_TEXT_BUFFER(state->buffer), &start, &end, FALSE);
+        GBytes *bytes = encode_document_chunk(text, encoding, ending, first, error);
+        g_free(text);
+        if (!bytes) return FALSE;
+        gsize length;
+        const void *data = g_bytes_get_data(bytes, &length);
+        gboolean ok = fd < 0 || file_write_all(fd, data, length, error);
+        if (ok && checksum) g_checksum_update(checksum, data, length);
+        g_bytes_unref(bytes);
+        if (!ok) return FALSE;
+        start = end; first = FALSE;
+    } while (!gtk_text_iter_is_end(&end));
+    return TRUE;
+}
+
 static gboolean save_contents(AppState *state, const char *filename, TextEncoding encoding, LineEnding ending) {
-    gchar *text = buffer_text(state);
     GError *error = NULL;
-    GBytes *bytes = encode_document(text, encoding, ending, &error);
-    g_free(text);
-    gboolean saved = FALSE;
-    if (bytes) {
-        gsize size;
-        const gchar *data = g_bytes_get_data(bytes, &size);
-        saved = g_file_set_contents(filename, data, size, &error);
-    }
+    AtomicFile file = {.fd = -1};
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    /* Validate conversions before touching the destination. Saving is synchronous,
+     * so the buffer remains a consistent snapshot throughout both bounded passes. */
+    gboolean saved = write_buffer_chunks(state, -1, encoding, ending, NULL, &error) &&
+        atomic_file_begin(&file, filename, FALSE, &error) &&
+        write_buffer_chunks(state, file.fd, encoding, ending, checksum, &error) &&
+        atomic_file_commit(&file, &error);
+    atomic_file_abort(&file);
     if (saved) {
         recovery_clear(state);
         gchar *name = g_strdup(filename);
         g_free(state->filename); state->filename = name;
         state->encoding = encoding; state->ending = ending;
-        gsize size;
-        const guchar *data = g_bytes_get_data(bytes, &size);
-        gchar *checksum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, data, size);
-        watch_file(state, checksum); g_free(checksum);
+        watch_file(state, g_checksum_get_string(checksum));
         gtk_text_buffer_set_modified(GTK_TEXT_BUFFER(state->buffer), FALSE);
         update_title(state); update_status(state);
     } else {
         show_error(state, "Could not save file", error);
         g_clear_error(&error);
     }
-    g_clear_pointer(&bytes, g_bytes_unref);
+    g_checksum_free(checksum);
     return saved;
 }
 
@@ -446,6 +470,7 @@ static void loading_controls(AppState *state, gboolean loading) {
     gtk_widget_set_sensitive(state->find_bar, !loading);
     gtk_widget_set_sensitive(state->status, !loading);
     update_change_notice(state);
+    if (!loading) spelling_view_changed(NULL, state);
     if (active_state(state) != state) return;
     gchar **names = g_action_group_list_actions(G_ACTION_GROUP(state->app));
     for (int i = 0; names[i]; i++) {
@@ -568,8 +593,9 @@ static void read_document_thread(GTask *task, gpointer source, gpointer task_dat
             if (g_file_load_contents(file, cancel, &contents, &length, NULL, &error)) {
                 job->checksum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar *)contents, length);
                 job->document = g_new0(RecoveryDocument, 1);
-                job->document->text = decode_document(contents, length, job->requested_encoding,
+                job->document->text = decode_document_owned(contents, length, job->requested_encoding,
                     &job->document->encoding, &job->document->ending, &error);
+                contents = NULL;
             }
             g_free(contents);
         }
@@ -1800,55 +1826,129 @@ static gboolean enchant_setup(AppState *state) {
     return state->dictionary != NULL;
 }
 
+typedef struct { int start, end; } SpellRange;
+
+static GArray *visible_spell_ranges(AppState *state) {
+    GArray *ranges = g_array_new(FALSE, FALSE, sizeof(SpellRange));
+    if (!state->spell_enabled || !state->dictionary || state->encoding == ENCODING_BYTES ||
+        state->loading || !gtk_widget_get_mapped(GTK_WIDGET(state->view))) return ranges;
+    GtkTextView *view = GTK_TEXT_VIEW(state->view);
+    GdkRectangle visible;
+    gtk_text_view_get_visible_rect(view, &visible);
+    /* Include a screen above and below. Slice each display row horizontally,
+     * so a very long unwrapped paragraph cannot create a file-sized range. */
+    int bottom = visible.y + 2 * visible.height;
+    for (int y = MAX(0, visible.y - visible.height); y <= bottom;) {
+        GtkTextIter start, end;
+        gtk_text_view_get_iter_at_location(view, &start, visible.x, y);
+        gtk_text_view_get_iter_at_location(view, &end, visible.x + visible.width, y);
+        if (gtk_text_iter_compare(&start, &end) > 0) {
+            GtkTextIter swap = start; start = end; end = swap;
+        }
+        GdkRectangle location;
+        gtk_text_view_get_iter_location(view, &start, &location);
+        y = MAX(y + 1, location.y + MAX(1, location.height));
+        gtk_text_iter_backward_chars(&start, 128);
+        gtk_text_iter_forward_chars(&end, 128);
+        for (int i = 0; i < 1024 && !gtk_text_iter_is_start(&start); i++) {
+            GtkTextIter previous = start; gtk_text_iter_backward_char(&previous);
+            if (!g_unichar_isalpha(gtk_text_iter_get_char(&previous))) break;
+            start = previous;
+        }
+        for (int i = 0; i < 1024 && g_unichar_isalpha(gtk_text_iter_get_char(&end)); i++)
+            gtk_text_iter_forward_char(&end);
+        SpellRange range = {gtk_text_iter_get_offset(&start), gtk_text_iter_get_offset(&end)};
+        if (ranges->len) {
+            SpellRange *last = &g_array_index(ranges, SpellRange, ranges->len - 1);
+            if (range.start <= last->end) { last->end = MAX(last->end, range.end); continue; }
+        }
+        g_array_append_val(ranges, range);
+    }
+    return ranges;
+}
+
+static void clear_spelling_tags(GtkTextBuffer *buffer) {
+    GtkTextTag *tag = gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buffer), "misspelled");
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(buffer, &start);
+    /* Removing a tag over the whole document invalidates distant text layout.
+     * Visit the tag's actual ranges instead, including offsets shifted by edits. */
+    while (!gtk_text_iter_is_end(&start)) {
+        if (!gtk_text_iter_has_tag(&start, tag) && !gtk_text_iter_forward_to_tag_toggle(&start, tag)) break;
+        GtkTextIter end = start;
+        gtk_text_iter_forward_to_tag_toggle(&end, tag);
+        gtk_text_buffer_remove_tag(buffer, tag, &start, &end);
+        start = end;
+    }
+}
+
 static gboolean spell_scan_idle(gpointer data) {
     AppState *state = data;
-    GtkTextIter start, end;
     GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
-    if (state->spell_offset == 0) {
-        gtk_text_buffer_get_bounds(buffer, &start, &end);
-        gtk_text_buffer_remove_tag_by_name(buffer, "misspelled", &start, &end);
-    }
-    if (!state->spell_enabled || !state->dictionary || state->encoding == ENCODING_BYTES || state->loading) {
-        state->spell_idle = 0; return G_SOURCE_REMOVE;
-    }
-    gtk_text_buffer_get_iter_at_offset(buffer, &start, state->spell_offset);
+    GArray *ranges = visible_spell_ranges(state);
+    gboolean changed = state->spell_dirty || !state->spell_ranges ||
+        ranges->len != state->spell_ranges->len ||
+        (ranges->len && memcmp(ranges->data, state->spell_ranges->data, ranges->len * sizeof(SpellRange)) != 0);
+    if (changed) {
+        clear_spelling_tags(buffer);
+        g_clear_pointer(&state->spell_ranges, g_array_unref);
+        state->spell_ranges = ranges;
+        state->spell_range = 0;
+        state->spell_offset = ranges->len ? g_array_index(ranges, SpellRange, 0).start : 0;
+        state->spell_dirty = FALSE;
+    } else g_array_unref(ranges);
     gint64 deadline = g_get_monotonic_time() + 3000;
-    while (!gtk_text_iter_is_end(&start)) {
-        int skipped = 0;
-        while (!gtk_text_iter_is_end(&start) && !g_unichar_isalpha(gtk_text_iter_get_char(&start))) {
-            gtk_text_iter_forward_char(&start);
-            if (++skipped >= 1024) break;
-        }
-        if (gtk_text_iter_is_end(&start)) break;
-        if (g_unichar_isalpha(gtk_text_iter_get_char(&start))) {
-            GtkTextIter word_start = start, word_end = start;
-            int letters = 0;
-            while (!gtk_text_iter_is_end(&word_end) && g_unichar_isalpha(gtk_text_iter_get_char(&word_end)) && letters < 1024) {
-                gtk_text_iter_forward_char(&word_end); letters++;
+    while (state->spell_range < state->spell_ranges->len) {
+        SpellRange range = g_array_index(state->spell_ranges, SpellRange, state->spell_range);
+        GtkTextIter start;
+        gtk_text_buffer_get_iter_at_offset(buffer, &start, state->spell_offset);
+        while (!gtk_text_iter_is_end(&start) && gtk_text_iter_get_offset(&start) < range.end) {
+            int skipped = 0;
+            while (!gtk_text_iter_is_end(&start) && gtk_text_iter_get_offset(&start) < range.end &&
+                   !g_unichar_isalpha(gtk_text_iter_get_char(&start))) {
+                gtk_text_iter_forward_char(&start);
+                if (++skipped >= 1024) break;
             }
-            /* Skip pathological words, including continuation chunks. */
-            GtkTextIter previous = word_start;
-            gboolean continuation = gtk_text_iter_backward_char(&previous) && g_unichar_isalpha(gtk_text_iter_get_char(&previous));
-            if (letters < 1024 && !continuation) {
-                gchar *word = gtk_text_buffer_get_text(buffer, &word_start, &word_end, FALSE);
-                if (letters > 1 && state->dict_check(state->dictionary, word, strlen(word)) > 0)
-                    gtk_text_buffer_apply_tag_by_name(buffer, "misspelled", &word_start, &word_end);
-                g_free(word);
+            if (gtk_text_iter_is_end(&start) || gtk_text_iter_get_offset(&start) >= range.end) break;
+            if (g_unichar_isalpha(gtk_text_iter_get_char(&start))) {
+                GtkTextIter word_start = start, word_end = start;
+                int letters = 0;
+                while (!gtk_text_iter_is_end(&word_end) && g_unichar_isalpha(gtk_text_iter_get_char(&word_end)) && letters < 1024) {
+                    gtk_text_iter_forward_char(&word_end); letters++;
+                }
+                GtkTextIter previous = word_start;
+                gboolean continuation = gtk_text_iter_backward_char(&previous) && g_unichar_isalpha(gtk_text_iter_get_char(&previous));
+                if (letters > 1 && letters < 1024 && !continuation) {
+                    gchar *word = gtk_text_buffer_get_text(buffer, &word_start, &word_end, FALSE);
+                    if (state->dict_check(state->dictionary, word, strlen(word)) > 0)
+                        gtk_text_buffer_apply_tag_by_name(buffer, "misspelled", &word_start, &word_end);
+                    g_free(word);
+                }
+                start = word_end;
             }
-            start = word_end;
+            if (g_get_monotonic_time() >= deadline) {
+                state->spell_offset = gtk_text_iter_get_offset(&start); return G_SOURCE_CONTINUE;
+            }
         }
-        if (g_get_monotonic_time() >= deadline) {
-            state->spell_offset = gtk_text_iter_get_offset(&start); return G_SOURCE_CONTINUE;
-        }
+        state->spell_range++;
+        if (state->spell_range < state->spell_ranges->len)
+            state->spell_offset = g_array_index(state->spell_ranges, SpellRange, state->spell_range).start;
     }
     state->spell_idle = 0; return G_SOURCE_REMOVE;
+}
+
+static void spelling_view_changed(gpointer object, gpointer data) {
+    (void)object;
+    AppState *state = data;
+    if (!state->disposed && !state->closed && !state->spell_idle)
+        state->spell_idle = g_idle_add(spell_scan_idle, state);
 }
 
 static void schedule_spell_scan(GtkTextBuffer *buffer, gpointer data) {
     (void)buffer;
     AppState *state = data;
     state->document_revision++;
-    state->spell_offset = 0;
+    state->spell_dirty = TRUE;
     /* Do not destroy a model button during its own activation. The menu is
      * a snapshot until the next opening; revision guards reject old targets. */
     spelling_actions_enabled(state, FALSE);
@@ -2220,7 +2320,7 @@ static gboolean recovery_tick(gpointer data) {
         !gtk_text_buffer_get_modified(GTK_TEXT_BUFFER(state->buffer)) || state->document_revision == state->recovery_revision)
         return G_SOURCE_CONTINUE;
     state->snapshot_revision = state->document_revision; state->snapshot_offset = 0;
-    state->snapshot = g_string_new(NULL);
+    state->snapshot = g_string_sized_new(gtk_text_buffer_get_char_count(GTK_TEXT_BUFFER(state->buffer)));
     state->recovery_idle = g_idle_add(snapshot_chunk, state);
     return G_SOURCE_CONTINUE;
 }
@@ -2551,6 +2651,16 @@ static void create_editor(AppState *state) {
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(state->view), state->word_wrap ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     state->scroller = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(state->scroller), GTK_WIDGET(state->view));
+    GtkAdjustment *adjustments[] = {
+        gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(state->scroller)),
+        gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(state->scroller))
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(adjustments); i++) {
+        g_signal_connect(adjustments[i], "value-changed", G_CALLBACK(spelling_view_changed), state);
+        g_signal_connect(adjustments[i], "changed", G_CALLBACK(spelling_view_changed), state);
+    }
+    g_signal_connect(state->view, "map", G_CALLBACK(spelling_view_changed), state);
+    g_signal_connect(state->view, "unmap", G_CALLBACK(spelling_view_changed), state);
     gtk_widget_set_vexpand(state->scroller, TRUE);
     build_search_bar(state);
     gtk_box_append(GTK_BOX(root), state->find_bar);
@@ -2922,6 +3032,7 @@ static void dispose_document(AppState *state) {
     g_clear_pointer(&state->spell_languages, g_ptr_array_unref); g_free(state->spell_language);
     print_options_clear(&state->printing);
     if (state->spell_idle) g_source_remove(state->spell_idle);
+    g_clear_pointer(&state->spell_ranges, g_array_unref);
     g_clear_object(&state->spelling_menu);
     if (state->broker_free_dict && state->dictionary) state->broker_free_dict(state->broker, state->dictionary);
     if (state->broker_free && state->broker) state->broker_free(state->broker);

@@ -10,7 +10,7 @@ static void pump(void) {
 
 static void wait_loaded(AppState *state, guint mib) {
     gint64 deadline = g_get_monotonic_time() + (gint64)MAX(120, mib * 4) * G_TIME_SPAN_SECOND;
-    while (!state->disposed && (state->loading || state->count_idle || state->search_idle)) {
+    while (!state->disposed && (state->loading || state->count_idle || state->search_idle || state->spell_idle)) {
         g_assert_cmpint(g_get_monotonic_time(), <, deadline);
         pump();
     }
@@ -51,12 +51,13 @@ int main(void) {
     GtkApplication *app = gtk_application_new(QUILLMOTE_APP_ID ".MemoryTest", G_APPLICATION_NON_UNIQUE);
     g_assert_true(g_application_register(G_APPLICATION(app), NULL, NULL));
     activate(app, &root);
-    root.spell_enabled = FALSE;
-    save_preferences(&root);
+    g_assert_true(root.spell_enabled);
+    g_assert_nonnull(root.dictionary);
     while (root.recovery_start_idle || root.count_idle) pump();
     gchar *path = g_build_filename(directory, "large.txt", NULL);
     FILE *file = fopen(path, "wb"); g_assert_nonnull(file);
-    char block[4096]; memset(block, 'a', sizeof block);
+    char block[4096];
+    for (gsize i = 0; i < sizeof block; i++) block[i] = "zzzxqv "[i % 7];
     for (gsize i = 127; i < sizeof block; i += 128) block[i] = '\n';
     const char *size = g_getenv("QUILLMOTE_MEMORY_TEST_MIB");
     guint mib = size ? (guint)g_ascii_strtoull(size, NULL, 10) : 32;
@@ -67,6 +68,29 @@ int main(void) {
     for (int i = 0; i < 2; i++) {
         AppState *tab = open_tab(&root, path, FALSE, FALSE);
         wait_loaded(tab, mib);
+        /* Spelling stays enabled while annotation storage follows scrolling. */
+        guint covered = 0;
+        for (guint r = 0; r < tab->spell_ranges->len; r++) {
+            SpellRange range = g_array_index(tab->spell_ranges, SpellRange, r);
+            covered += range.end - range.start;
+        }
+        g_assert_cmpuint(covered, <, 512 * 1024);
+        GtkTextIter first, bottom;
+        gtk_text_buffer_get_start_iter(GTK_TEXT_BUFFER(tab->buffer), &first);
+        GtkTextTag *tag = gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(GTK_TEXT_BUFFER(tab->buffer)), "misspelled");
+        g_assert_true(gtk_text_iter_has_tag(&first, tag));
+        gtk_text_buffer_get_iter_at_line(GTK_TEXT_BUFFER(tab->buffer), &bottom,
+            gtk_text_buffer_get_line_count(GTK_TEXT_BUFFER(tab->buffer)) - 8);
+        gtk_text_buffer_place_cursor(GTK_TEXT_BUFFER(tab->buffer), &bottom);
+        gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(tab->view), &bottom, 0, TRUE, 0, 0.5);
+        gint64 scroll_deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+        while (g_get_monotonic_time() < scroll_deadline) pump();
+        wait_loaded(tab, mib);
+        g_assert_false(gtk_text_iter_has_tag(&first, tag));
+        /* Start at the next complete word, since each line can begin midword. */
+        while (g_unichar_isalpha(gtk_text_iter_get_char(&bottom))) gtk_text_iter_forward_char(&bottom);
+        gtk_text_iter_forward_char(&bottom);
+        g_assert_true(gtk_text_iter_has_tag(&bottom, tag));
         gpointer buffer = tab->buffer, view = tab->view, page = tab->page, search = tab->search_context;
         g_object_add_weak_pointer(G_OBJECT(buffer), &buffer);
         g_object_add_weak_pointer(G_OBJECT(view), &view);

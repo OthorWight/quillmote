@@ -13,12 +13,12 @@ VERSION := $(shell sed -n 's/^\#define QUILLMOTE_VERSION "\(.*\)"/\1/p' app-info
 APP_ID := org.quillmote.Quillmote
 GTK_CFLAGS = $(shell $(PKG_CONFIG) --cflags gtksourceview-5)
 GTK_LIBS = $(shell $(PKG_CONFIG) --libs gtksourceview-5)
-SUPPORT_SOURCES := session.c document.c printing.c recovery.c help.c build/resources.c
-HEADERS := session.h document.h printing.h recovery.h help.h app-info.h
-OBJECTS := build/session.o build/main.o build/document.o build/printing.o build/recovery.o build/help.o build/resources.o
+SUPPORT_SOURCES := session.c document.c printing.c recovery.c help.c fileio.c build/resources.c
+HEADERS := session.h document.h printing.h recovery.h help.h fileio.h app-info.h
+OBJECTS := build/session.o build/main.o build/document.o build/printing.o build/recovery.o build/help.o build/fileio.o build/resources.o
 GUI_TESTS := tests/appearance tests/themes tests/features tests/workflows tests/editor tests/help tests/memory tests/session tests/file-changes
-TESTS := tests/document $(GUI_TESTS)
-DIST_FILES := Makefile README.md LICENSE CHANGELOG.md CONTRIBUTING.md app-info.h main.c session.c session.h document.c document.h printing.c printing.h recovery.c recovery.h help.c help.h .gitignore data docs tests/*.c tests/*.h tools/*.sh
+TESTS := tests/document tests/storage $(GUI_TESTS)
+DIST_FILES := Makefile README.md LICENSE CHANGELOG.md CONTRIBUTING.md app-info.h main.c session.c session.h document.c document.h printing.c printing.h recovery.c recovery.h help.c help.h fileio.c fileio.h .gitignore data docs tests/*.c tests/*.h tools/*.sh
 
 all: quillmote
 
@@ -50,6 +50,9 @@ $(GUI_TESTS): %: %.c main.c $(SUPPORT_SOURCES) $(HEADERS) tests/ui.h | check-dep
 
 tests/document: tests/document.c document.c document.h | check-deps
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(GTK_CFLAGS) tests/document.c document.c $(LDFLAGS) -o $@ $(GTK_LIBS) $(LDLIBS)
+
+tests/storage: tests/storage.c document.c recovery.c fileio.c document.h recovery.h fileio.h | check-deps
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(GTK_CFLAGS) tests/storage.c document.c recovery.c fileio.c $(LDFLAGS) -o $@ $(GTK_LIBS) $(LDLIBS)
 
 test: $(TESTS)
 	@set -e; for test in $(TESTS); do ./$$test; done

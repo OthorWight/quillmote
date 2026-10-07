@@ -77,10 +77,37 @@ static void raw_bytes(void) {
     g_assert_nonnull(error); g_clear_error(&error);
 }
 
+static void owned_and_chunked(void) {
+    TextEncoding encoding; LineEnding ending; GError *error = NULL;
+    gchar *owned = g_strdup("\xef\xbb\xbf" "café\r\nsecond\rthird\n");
+    gchar *text = decode_document_owned(owned, strlen(owned), -1, &encoding, &ending, &error);
+    g_assert_no_error(error); g_assert_true(text == owned);
+    g_assert_cmpstr(text, ==, "café\nsecond\nthird\n");
+    g_assert_cmpint(encoding, ==, ENCODING_UTF8_BOM); g_assert_cmpint(ending, ==, ENDING_CRLF);
+    g_free(text);
+    const char *chunks[] = {"café\n", "costs €5\n", ""};
+    for (int format = ENCODING_UTF8; format <= ENCODING_ANSI; format++) {
+        for (int lines = ENDING_LF; lines <= ENDING_CR; lines++) {
+            GByteArray *output = g_byte_array_new();
+            for (guint j = 0; j < G_N_ELEMENTS(chunks); j++) {
+                GBytes *bytes = encode_document_chunk(chunks[j], format, lines, j == 0, &error);
+                g_assert_no_error(error); g_assert_nonnull(bytes);
+                gsize length; const guint8 *data = g_bytes_get_data(bytes, &length);
+                g_byte_array_append(output, data, length); g_bytes_unref(bytes);
+            }
+            text = decode_document((const char *)output->data, output->len, -1, &encoding, &ending, &error);
+            g_assert_no_error(error); g_assert_cmpstr(text, ==, "café\ncosts €5\n");
+            g_assert_cmpint(encoding, ==, format); g_assert_cmpint(ending, ==, lines);
+            g_free(text); g_byte_array_unref(output);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/document/round-trip", round_trip);
     g_test_add_func("/document/unicode-and-invalid", unicode_and_invalid);
     g_test_add_func("/document/raw-bytes", raw_bytes);
+    g_test_add_func("/document/owned-and-chunked", owned_and_chunked);
     return g_test_run();
 }

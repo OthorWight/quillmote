@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "recovery.h"
+#include "fileio.h"
 #include <glib/gstdio.h>
 #include <sys/file.h>
 #include <fcntl.h>
@@ -89,19 +90,49 @@ done:
     g_key_file_unref(key); return doc;
 }
 
+static gboolean write_snapshot_text(int fd, const char *text, GError **error) {
+    char chunk[16384];
+    gsize used = 0;
+    gboolean leading = TRUE;
+    for (const char *p = text; *p; p++) {
+        const char *escaped = NULL;
+        switch (*p) {
+            case '\\': escaped = "\\\\"; break;
+            case '\n': escaped = "\\n"; break;
+            case '\r': escaped = "\\r"; break;
+            case '\t': escaped = "\\t"; break;
+            case ' ': if (leading) escaped = "\\s"; break;
+        }
+        if (*p != ' ' && *p != '\t') leading = FALSE;
+        if (used + 2 > sizeof chunk) {
+            if (!file_write_all(fd, chunk, used, error)) return FALSE;
+            used = 0;
+        }
+        if (escaped) { chunk[used++] = escaped[0]; chunk[used++] = escaped[1]; }
+        else chunk[used++] = *p;
+    }
+    return file_write_all(fd, chunk, used, error);
+}
+
 gchar *recovery_write_temporary(const char *path, const RecoveryDocument *doc, GError **error) {
+    /* Keep the existing key-file format readable by previous releases. Only
+     * metadata goes through GKeyFile: text is escaped with bounded storage. */
     GKeyFile *key = g_key_file_new();
-    g_key_file_set_string(key, "Document", "text", doc->text);
     if (doc->filename) g_key_file_set_string(key, "Document", "filename", doc->filename);
     g_key_file_set_integer(key, "Document", "encoding", doc->encoding);
     g_key_file_set_integer(key, "Document", "ending", doc->ending);
     g_key_file_set_integer(key, "Document", "cursor", doc->cursor);
     gsize length;
-    gchar *contents = g_key_file_to_data(key, &length, NULL);
+    gchar *metadata = g_key_file_to_data(key, &length, NULL);
     gchar *id = g_uuid_string_random(), *temporary = g_strconcat(path, ".", id, ".tmp", NULL);
-    gboolean ok = g_file_set_contents_full(temporary, contents, length,
-        G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE, 0600, error);
-    g_free(id); g_free(contents); g_key_file_unref(key);
-    if (!ok) { g_free(temporary); return NULL; }
+    AtomicFile file = {.fd = -1};
+    gboolean ok = atomic_file_begin(&file, temporary, TRUE, error) &&
+        file_write_all(file.fd, metadata, length, error) &&
+        file_write_all(file.fd, "text=", 5, error) &&
+        write_snapshot_text(file.fd, doc->text, error) &&
+        file_write_all(file.fd, "\n", 1, error) && atomic_file_commit(&file, error);
+    atomic_file_abort(&file);
+    g_free(id); g_free(metadata); g_key_file_unref(key);
+    if (!ok) { g_unlink(temporary); g_free(temporary); return NULL; }
     return temporary;
 }

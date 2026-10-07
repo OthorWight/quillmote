@@ -11,3 +11,5 @@ tests/memory
 /dist/
 tests/session
 tests/file-changes
+
+tests/storage

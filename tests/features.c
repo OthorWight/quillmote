@@ -232,6 +232,89 @@ static void check_arbitrary_file(AppState *state, const char *directory) {
 }
 
 
+static void check_unwrapped_spelling(AppState *state) {
+    g_assert_nonnull(state->dictionary);
+    g_assert_true(state->spell_enabled);
+    g_assert_cmpint(gtk_text_view_get_wrap_mode(GTK_TEXT_VIEW(state->view)), ==, GTK_WRAP_NONE);
+    GString *text = g_string_new(NULL);
+    for (int i = 0; i < 10000; i++) g_string_append(text, "zzzxqv ");
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
+    gtk_text_buffer_set_text(buffer, text->str, text->len);
+    caret(state, 0); flush_events();
+    g_assert_nonnull(state->spell_ranges);
+    g_assert_cmpuint(state->spell_ranges->len, >, 0);
+    SpellRange range = g_array_index(state->spell_ranges, SpellRange, 0);
+    g_assert_cmpint(range.end - range.start, <, 16384);
+    guint64 revision = state->document_revision;
+    GtkTextIter first, last;
+    gtk_text_buffer_get_start_iter(buffer, &first);
+    GtkTextTag *tag = gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buffer), "misspelled");
+    g_assert_true(gtk_text_iter_has_tag(&first, tag));
+    gtk_text_buffer_get_iter_at_offset(buffer, &last, 69993);
+    gtk_text_buffer_place_cursor(buffer, &last);
+    gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(state->view), &last, 0, TRUE, 0.5, 0);
+    gint64 deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline) {
+        g_main_context_iteration(NULL, FALSE); g_usleep(1000);
+    }
+    flush_events();
+    g_assert_cmpuint(state->document_revision, ==, revision);
+    range = g_array_index(state->spell_ranges, SpellRange, 0);
+    g_assert_cmpint(range.start, >, 50000);
+    g_assert_cmpint(range.end - range.start, <, 16384);
+    g_assert_false(gtk_text_iter_has_tag(&first, tag));
+    g_assert_true(gtk_text_iter_has_tag(&last, tag));
+    g_string_free(text, TRUE);
+}
+
+static void check_chunked_saves(AppState *state, const char *directory) {
+    gchar *path = g_build_filename(directory, "chunked.txt", NULL);
+    GString *text = g_string_new(NULL);
+    /* Unicode and newlines straddle the 32768-character chunk boundary. */
+    for (int i = 0; i < 15000; i++) g_string_append(text, "café\n");
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->buffer);
+    gtk_text_buffer_set_text(buffer, text->str, text->len);
+    for (int encoding = ENCODING_UTF8; encoding <= ENCODING_ANSI; encoding++) {
+        for (int ending = ENDING_LF; ending <= ENDING_CR; ending++) {
+            GError *error = NULL;
+            GBytes *expected = encode_document(text->str, encoding, ending, &error);
+            g_assert_no_error(error);
+            g_assert_true(save_contents(state, path, encoding, ending));
+            gchar *actual; gsize length, expected_length;
+            g_assert_true(g_file_get_contents(path, &actual, &length, &error));
+            g_assert_no_error(error);
+            const void *expected_data = g_bytes_get_data(expected, &expected_length);
+            g_assert_cmpmem(actual, length, expected_data, expected_length);
+            gchar *checksum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar *)actual, length);
+            g_assert_cmpstr(state->disk_checksum, ==, checksum);
+            g_free(checksum);
+            g_free(actual); g_bytes_unref(expected);
+            g_assert_false(gtk_text_buffer_get_modified(buffer));
+        }
+    }
+    /* A conversion error in the last chunk leaves the old file and edits intact. */
+    g_string_append(text, "日本語");
+    gtk_text_buffer_set_text(buffer, text->str, text->len);
+    gchar *original; gsize original_length;
+    g_assert_true(g_file_get_contents(path, &original, &original_length, NULL));
+    g_assert_false(save_contents(state, path, ENCODING_ANSI, ENDING_LF));
+    g_assert_true(gtk_text_buffer_get_modified(buffer));
+    assert_text(state, text->str);
+    answer_prompt(state, "Close");
+    gchar *actual; gsize length;
+    g_assert_true(g_file_get_contents(path, &actual, &length, NULL));
+    g_assert_cmpmem(actual, length, original, original_length);
+    g_free(actual); g_free(original);
+    /* UTF-16 still emits a BOM for an empty file. */
+    gtk_text_buffer_set_text(buffer, "", 0);
+    g_assert_true(save_contents(state, path, ENCODING_UTF16_LE, ENDING_LF));
+    g_assert_true(g_file_get_contents(path, &actual, &length, NULL));
+    g_assert_cmpmem(actual, length, "\xff\xfe", 2);
+    g_free(actual); g_string_free(text, TRUE); g_free(path);
+    request_document_change(state, PENDING_NEW);
+}
+
+
 int main(void) {
     GError *error = NULL;
     gchar *directory = g_dir_make_tmp("quillmote-features-XXXXXX", &error); g_assert_no_error(error);
@@ -254,6 +337,8 @@ int main(void) {
     answer_prompt(&state, "OK");
     check_file_lifecycle(&state, directory);
     check_arbitrary_file(&state, directory);
+    check_unwrapped_spelling(&state);
+    check_chunked_saves(&state, directory);
     check_printing(&state, directory);
     save_preferences(&state);
     AppState restored = {0}; load_preferences(&restored);

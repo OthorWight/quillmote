@@ -61,7 +61,7 @@ Press **F1** for an offline guide organized by topic. **Help → About Quillmote
 - Windows CRLF, Unix LF, and classic Mac CR line endings are recognized and preserved; Save As can change the convention. Mixed line endings are normalized to the first convention found. New documents default to UTF-8 and LF.
 - A file with `.LOG` on its first line gets the current time/date appended when opened. F5 inserts a timestamp at the cursor, replacing any selection.
 - Escape dismisses open menus and returns focus to the editor. On GTK 4.14 and newer, submenus navigate within one popup to avoid nested popup grabs.
-- Right-click an underlined word for spelling suggestions beside the normal editing commands. Shift+F10 or the Menu key opens suggestions at the cursor. Corrections support Undo. The same context menu offers Add to Dictionary and Ignore Word; ignored words last for the current dictionary session. Format → Spelling lets you turn checking off or choose an installed language. Additional languages require installing a dictionary supported by Enchant through your system’s package manager.
+- Right-click an underlined word for spelling suggestions beside the normal editing commands. Shift+F10 or the Menu key opens suggestions at the cursor. Corrections support Undo. The same context menu offers Add to Dictionary and Ignore Word; ignored words last for the current dictionary session. Underlines are checked around the visible text and update as you scroll; suggestions remain available at the cursor. Format → Spelling lets you turn checking off or choose an installed language. Additional languages require installing a dictionary supported by Enchant through your system’s package manager.
 - `Ctrl++` (or `Ctrl+=`) zooms in, `Ctrl+-` zooms out, and `Ctrl+0` resets to 100%. Zoom ranges from 50–300% and changes only the on-screen text, leaving the chosen font and printing size unchanged. The zoom level is remembered between launches.
 - Font, zoom, last Open/Save As folders, word wrap, word counts, invisible characters, status-bar visibility, spelling language/on-off, window size/maximized state, and page setup are saved in `$XDG_CONFIG_HOME/quillmote/settings.ini` (normally `~/.config/quillmote/settings.ini`).
 
@@ -93,8 +93,7 @@ Run the full suite in a graphical session. Tests cover encoding round trips and 
 For the file-format tests without a graphical session:
 
 ```sh
-make tests/document
-./tests/document
+make test TESTS="tests/document tests/storage"
 ```
 
 ## Source releases

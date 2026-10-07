@@ -10,7 +10,7 @@ Run `make test` in a graphical session and `make test-cli check-desktop` before 
 
 Preserve unsaved work across cancellation and errors. Keep long operations responsive. Add meaningful regression coverage for document lifecycle changes, and use the existing native widgets and system appearance.
 
-The memory test checks repeated file loads, document object destruction, and RAM release after tab closure. It uses a 32 MiB file by default. For a larger manual check, run `QUILLMOTE_MEMORY_TEST_MIB=128 make test TESTS=tests/memory` (32–1024 MiB). On Linux with glibc it also checks that resident memory falls after closing; GTK and allocator caches mean it need not return to exactly the startup value.
+The memory test keeps spelling enabled and checks bounded annotations while scrolling, repeated file loads, document object destruction, and RAM release after tab closure. It uses a 32 MiB file by default. For a larger manual check, run `QUILLMOTE_MEMORY_TEST_MIB=128 make test TESTS=tests/memory` (32–1024 MiB). On Linux with glibc it also checks that resident memory falls after closing; GTK and allocator caches mean it need not return to exactly the startup value.
 
 ## Preparing a release
 
